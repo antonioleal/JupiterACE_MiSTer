@@ -6,7 +6,7 @@
 //  This module reads the whole file to get its POSIX cksum CRC, then writes a
 //  delete request into sector 514 of games/JupiterACE/boot1.vhd (SD slot 1).
 //  JupiterACE.sh finds the open file with that checksum, moves it to
-//  games/JupiterACE/previous/deleted/ and writes the answer into the same
+//  games/JupiterACE/backup/deleted/ and writes the answer into the same
 //  sector, which this module polls and reports on the OSD.
 //
 //  Request sector layout:

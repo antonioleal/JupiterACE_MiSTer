@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# Release script for JupiterACE_MiSTer
-
 # Copyright 2026 Antonio Leal, Porto Salvo, Oeiras, Portugal
 # All rights reserved.
 #

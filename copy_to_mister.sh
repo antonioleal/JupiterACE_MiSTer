@@ -1,7 +1,5 @@
 #!/bin/bash
 
-# Copy JupiterACE_MiSTer files to Antonio's Machine
-
 # Copyright 2026 Antonio Leal, Porto Salvo, Oeiras, Portugal
 # All rights reserved.
 #
@@ -22,5 +20,18 @@
 #  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 #  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-scp output_files/JupiterACE.rbf root@mister:/media/fat/_Computer
-scp scripts/JupiterACE.sh root@mister:/media/fat/Scripts/
+# Copy the core and the helper script to the MiSTer.
+# One SSH connection is opened first and shared by both copies,
+# so the password is asked only once.
+
+HOST=${MISTER:-root@mister}
+SSH_OPT=(-o ControlMaster=auto -o "ControlPath=/tmp/copy_to_mister-%C" -o ControlPersist=30)
+
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+ssh "${SSH_OPT[@]}" -fN "$HOST" || { echo "Cannot connect to $HOST"; exit 1; }
+trap 'ssh "${SSH_OPT[@]}" -O exit "$HOST" 2>/dev/null' EXIT
+
+scp "${SSH_OPT[@]}" output_files/JupiterACE.rbf "$HOST":/media/fat/_Computer/ &&
+scp "${SSH_OPT[@]}" scripts/JupiterACE.sh "$HOST":/media/fat/Scripts/ &&
+echo "Copied to $HOST"

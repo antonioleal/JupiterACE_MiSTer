@@ -10,8 +10,9 @@
 #  Tapes: when the Ace SAVEs onto the inserted tape, this script merges each
 #  saved program into the inserted tape file (games/JupiterACE/..., any
 #  subfolder), replacing a program with the same name or appending it.
-#  Before each update the tape file is copied to games/JupiterACE/previous/
-#  (same subfolder, with a timestamp). With no tape inserted, SAVE starts a
+#  Before each update the tape file is copied to games/JupiterACE/backup/
+#  (same subfolder, with a timestamp); the newest KEEP_BACKUPS (3) copies of
+#  each tape are kept. With no tape inserted, SAVE starts a
 #  new tape: it becomes games/JupiterACE/<program name>.tap (with _2, _3, ...
 #  if that name is taken), and later saves in the session go into it.
 #
@@ -19,8 +20,9 @@
 #  numbered after the highest SNAPnnn.ace found in any subfolder.
 #
 #  Delete File: the file picked in the OSD is moved to
-#  games/JupiterACE/previous/deleted/ (same subfolder); the answer goes back
-#  to the core, which shows it on the OSD.
+#  games/JupiterACE/backup/deleted/ (same subfolder) and erased from there
+#  after DELETED_DAYS (30) days; the answer goes back to the core, which
+#  shows it on the OSD.
 #
 #  Usage (bash + BusyBox only):
 #    JupiterACE.sh            install into user-startup.sh and start
@@ -34,7 +36,9 @@
 
 FAT=${JA_FAT:-/media/fat}
 GAMES=$FAT/games/JupiterACE
-PREV=$GAMES/previous
+PREV=$GAMES/backup
+KEEP_BACKUPS=3             # backups kept per tape in backup/
+DELETED_DAYS=30            # days a file stays in backup/deleted/
 VHD=$GAMES/boot1.vhd       # written by the core (SD slot 1): sectors 0-256 snapshots,
 VHD_SECTORS=515            #   257-513 tape saves, 514 delete requests
 SAV_OFF=$((257 * 512))     # start of the tape save area
@@ -227,7 +231,7 @@ merge_save() {
 		"$GAMES"/*)
 			rel=${target#"$GAMES"/}
 			dir=$PREV/$(dirname "$rel"); [ "$(dirname "$rel")" = . ] && dir=$PREV ;;
-		*)	rel=$target; dir=$(dirname "$target")/previous ;;
+		*)	rel=$target; dir=$(dirname "$target")/backup ;;
 	esac
 	# archive the current version (a tape created just now has none)
 	if [ -z "$created" ]; then
@@ -237,15 +241,12 @@ merge_save() {
 		o="$dir/${fname%.*}_$ts"; n=1
 		while [ -e "$o.${fname##*.}" ]; do n=$((n + 1)); o="$dir/${fname%.*}_${ts}_$n"; done
 		cp "$target" "$o.${fname##*.}" || { log "cannot archive $target"; return 1; }
+		prune_backups "$dir" "${fname%.*}" "${fname##*.}"
 	fi
 
 	# merge every program saved since the tape was inserted, in order
 	range "$VHD" $((SAV_OFF + 512)) "$plen" > "$WORK/payload"
 	cp "$target" "$WORK/tape"
-	# a blank tape made of empty TAP blocks (e.g. two zero bytes): start from nothing
-	if [ "$fmt" = 0 ] && [ "$(tr -d '\000' < "$WORK/tape" | head -c 1 | wc -c)" -eq 0 ]; then
-		: > "$WORK/tape"
-	fi
 	hdr=
 	while read -r o l k n; do
 		if [ "$k" = H ]; then
@@ -280,7 +281,7 @@ process() {
 	esac
 }
 
-# make_vhd: create boot1.vhd, or extend an older, smaller one (0 = changed now)
+# make_vhd: create boot1.vhd, or bring it to its full size (0 = changed now)
 make_vhd() {
 	local have=0
 	[ -f "$VHD" ] && have=$(( $(fsize "$VHD") / 512 ))
@@ -290,17 +291,34 @@ make_vhd() {
 	return 0
 }
 
-# make_files: boot1.vhd ready, and boot2.vhd of an earlier version gone (0 = boot1.vhd changed now)
-make_files() {
-	[ -f "$GAMES/boot2.vhd" ] && rm -f "$GAMES/boot2.vhd" && log "removed $GAMES/boot2.vhd (no longer used)"
-	make_vhd
+# ---- backups in backup/ ----
+# prune_backups DIR BASE EXT: keep only the newest $KEEP_BACKUPS backups of a tape
+# (backups are BASE_YYYYMMDD_HHMMSS[_n].EXT, so name order is age order)
+prune_backups() {
+	local d=$1 b=$2 e=$3 n f
+	n=$(ls "$d/$b"_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]*."$e" 2>/dev/null | wc -l)
+	[ "$n" -gt "$KEEP_BACKUPS" ] || return 0
+	ls "$d/$b"_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]*."$e" | sort | head -n $((n - KEEP_BACKUPS)) |
+	while IFS= read -r f; do rm -f "$f" && log "removed old backup ${f#"$GAMES"/}"; done
+}
+
+# purge_deleted: empty backup/deleted/ of files deleted more than $DELETED_DAYS days ago
+purge_deleted() {
+	local f
+	[ -d "$PREV/deleted" ] || return 0
+	find "$PREV/deleted" -type f -mtime +"$DELETED_DAYS" | while IFS= read -r f; do
+		rm -f "$f" && log "removed ${f#"$GAMES"/} (deleted over $DELETED_DAYS days ago)"
+	done
+	find "$PREV/deleted" -depth -type d | while IFS= read -r f; do
+		[ "$f" = "$PREV/deleted" ] || rmdir "$f" 2>/dev/null   # only empty folders go
+	done
 }
 
 # ---- Delete File ----
 # answer N: tell the core how the delete request went (3 = deleted, 4 = not)
 answer() { done_mark "$DEL_OFF" "$1"; }
 
-# delete_req: move the file picked in the OSD "Delete File" to previous/deleted/
+# delete_req: move the file picked in the OSD "Delete File" to backup/deleted/
 delete_req() {
 	local h=$WORK/del_hdr crc len f pid target rel dest base ext ts
 	[ -f "$VHD" ] && [ "$(fsize "$VHD")" -ge $((DEL_OFF + 512)) ] || return 0
@@ -323,19 +341,20 @@ delete_req() {
 		done
 	done
 	if [ -z "$target" ]; then
-		log "Delete File: the picked file was not found (only .tap/.tzx/.ace outside previous/ are deleted)"
+		log "Delete File: the picked file was not found (only .tap/.tzx/.ace outside backup/ are deleted)"
 		answer 4; return 0
 	fi
 
 	case $target in
 		"$GAMES"/*) rel=${target#"$GAMES"/}; dest=$PREV/deleted/$rel ;;
-		*)          rel=$target; dest=$(dirname "$target")/previous/deleted/$(basename "$target") ;;
+		*)          rel=$target; dest=$(dirname "$target")/backup/deleted/$(basename "$target") ;;
 	esac
 	if [ -e "$dest" ]; then
 		ts=$(date +%Y%m%d_%H%M%S); base=${dest%.*}; ext=${dest##*.}
 		dest="${base}_$ts.$ext"
 	fi
 	if mkdir -p "$(dirname "$dest")" && mv "$target" "$dest"; then
+		touch "$dest"   # the 30 days count from the deletion, not from the file's own date
 		log "Delete File: moved $rel to ${dest#"$GAMES"/}"
 		answer 3
 	else
@@ -346,7 +365,7 @@ delete_req() {
 
 # ---- snapshots ----
 
-# next_snap: the next free SNAPnnn.ace name (searching all subfolders but previous/)
+# next_snap: the next free SNAPnnn.ace name (searching all subfolders but backup/)
 next_snap() {
 	local f n max=0
 	while IFS= read -r f; do
@@ -376,15 +395,17 @@ snap() {
 }
 
 daemon() {
-	local m vm=
+	local m vm= day=
 	echo $$ > "$PID"
 	log "watching $VHD"
-	make_files && log "load the JupiterACE core again so it uses the new boot1.vhd"
+	make_vhd && log "load the JupiterACE core again so it uses the new boot1.vhd"
 	while true; do
 		if [ -f "$VHD" ]; then
 			m=$(stat -c '%Y %s' "$VHD")
 			[ "$vm" != "$m" ] && { snap; process; delete_req; vm=$(stat -c '%Y %s' "$VHD"); }
 		fi
+		# once a day (and at start): empty old files out of backup/deleted/
+		[ "$day" != "$(date +%Y%m%d)" ] && { purge_deleted; day=$(date +%Y%m%d); }
 		sleep 2
 	done
 }
@@ -406,21 +427,10 @@ case "$1" in
 	daemon) daemon ;;
 	start)  start ;;
 	stop)   running && kill "$(cat "$PID")" && rm -f "$PID" && echo "Stopped." ;;
-	once)   process; snap; delete_req ;;
+	once)   process; snap; delete_req; purge_deleted ;;
 	"")
-		make_files && echo "Made $VHD: load the JupiterACE core again before saving."
-		# earlier versions of this script had other names: drop their startup lines
-		if [ -f "$STARTUP" ]; then
-			for old in jupiterace_saved.sh JupiterAce_Setup.sh JupiterACE_Setup.sh; do
-				[ "$(basename "$SELF")" = "$old" ] && continue
-				if grep -qF "/$old\"" "$STARTUP"; then
-					grep -vF "/$old\"" "$STARTUP" > "$STARTUP.tmp" && cat "$STARTUP.tmp" > "$STARTUP"
-					rm -f "$STARTUP.tmp"
-					echo "Removed $old from $STARTUP"
-				fi
-			done
-		fi
-		# restart, so a watcher started by an earlier version is replaced
+		make_vhd && echo "Made $VHD: load the JupiterACE core again before saving."
+		# restart, so an updated script takes over from the running watcher
 		running && kill "$(cat "$PID")" && rm -f "$PID" && sleep 1
 		line="[ -f \"$SELF\" ] && bash \"$SELF\" start"
 		if ! grep -qF "$SELF" "$STARTUP" 2>/dev/null; then
