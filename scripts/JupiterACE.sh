@@ -1,0 +1,435 @@
+#!/bin/bash
+#============================================================================
+#  JupiterACE.sh - tape saves and snapshots for the JupiterACE core
+#
+#  The core cannot create files, so this script creates a fixed-size file,
+#  games/JupiterACE/boot1.vhd, that Main_MiSTer mounts when the core starts,
+#  and watches it. The core writes snapshots into its first half and tape
+#  saves into its second half.
+#
+#  Tapes: when the Ace SAVEs onto the inserted tape, this script merges each
+#  saved program into the inserted tape file (games/JupiterACE/..., any
+#  subfolder), replacing a program with the same name or appending it.
+#  Before each update the tape file is copied to games/JupiterACE/previous/
+#  (same subfolder, with a timestamp). With no tape inserted, SAVE starts a
+#  new tape: it becomes games/JupiterACE/<program name>.tap (with _2, _3, ...
+#  if that name is taken), and later saves in the session go into it.
+#
+#  Snapshots: each new snapshot is copied to games/JupiterACE/SNAPnnn.ace,
+#  numbered after the highest SNAPnnn.ace found in any subfolder.
+#
+#  Delete File: the file picked in the OSD is moved to
+#  games/JupiterACE/previous/deleted/ (same subfolder); the answer goes back
+#  to the core, which shows it on the OSD.
+#
+#  Usage (bash + BusyBox only):
+#    JupiterACE.sh            install into user-startup.sh and start
+#    JupiterACE.sh start      start the watcher in the background
+#    JupiterACE.sh stop       stop the watcher
+#    JupiterACE.sh daemon     run the watcher in the foreground
+#    JupiterACE.sh once       process boot1.vhd now (testing)
+#
+#  Log: /tmp/jupiterace_saved.log
+#============================================================================
+
+FAT=${JA_FAT:-/media/fat}
+GAMES=$FAT/games/JupiterACE
+PREV=$GAMES/previous
+VHD=$GAMES/boot1.vhd       # written by the core (SD slot 1): sectors 0-256 snapshots,
+VHD_SECTORS=515            #   257-513 tape saves, 514 delete requests
+SAV_OFF=$((257 * 512))     # start of the tape save area
+DEL_OFF=$((514 * 512))     # delete request sector
+STARTUP=$FAT/linux/user-startup.sh
+SELF=$(readlink -f "$0")
+RUN=${JA_RUN:-/tmp}
+LOG=$RUN/jupiterace_saved.log
+MAP=$RUN/jupiterace_saved.map
+PID=$RUN/jupiterace_saved.pid
+WORK=$RUN/jupiterace_saved.work
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+# ---- binary helpers (little-endian, like the MiSTer's ARM CPU) ----
+u8()   { local v; v=$(od -An -tu1 -j "$2" -N1 "$1" | tr -d ' \n'); echo "${v:-0}"; }
+u16()  { echo $(( $(u8 "$1" "$2") + $(u8 "$1" $(($2 + 1))) * 256 )); }
+u24()  { echo $(( $(u16 "$1" "$2") + $(u8 "$1" $(($2 + 2))) * 65536 )); }
+u32()  { echo $(( $(u16 "$1" "$2") + $(u16 "$1" $(($2 + 2))) * 65536 )); }
+hexs() { od -An -tx1 -v -j "$2" -N "$3" "$1" | tr -d ' \n'; }
+# range FILE OFFSET LENGTH: copy LENGTH bytes starting at OFFSET to stdout
+range() { [ "$3" -gt 0 ] && tail -c +$(($2 + 1)) "$1" | head -c "$3"; return 0; }
+fsize() { stat -c %s "$1"; }
+
+# ---- block lists ----
+# blocks FILE FORMAT START: one line per block: "offset length kind name"
+#   kind H = Ace header block (name = 10 name bytes in hex), D = data block, O = other
+blocks() {
+	local f=$1 fmt=$2 off=$3 size id len end dl fl
+	size=$(fsize "$f")
+	if [ "$fmt" = 0 ]; then
+		# TAP: [len lo][len hi][block]; a 26-byte block is a header (no block-type byte)
+		while [ $((off + 2)) -le "$size" ]; do
+			len=$(u16 "$f" "$off")
+			end=$((off + 2 + len))
+			[ "$end" -gt "$size" ] && break
+			if [ "$len" -eq 26 ]; then
+				echo "$off $((end - off)) H $(hexs "$f" $((off + 3)) 10)"
+			else
+				echo "$off $((end - off)) D -"
+			fi
+			off=$end
+		done
+	else
+		# TZX: walk the blocks by ID
+		while [ "$off" -lt "$size" ]; do
+			id=$(u8 "$f" "$off")
+			dl=-1; fl=0
+			case $id in
+				16) dl=$(u16 "$f" $((off + 3))); len=$((5 + dl)); fl=5 ;;     # 0x10 standard data
+				17) dl=$(u24 "$f" $((off + 16))); len=$((19 + dl)); fl=19 ;;  # 0x11 turbo data
+				18) len=5 ;;
+				19) len=$((2 + 2 * $(u8 "$f" $((off + 1))))) ;;
+				20) dl=$(u24 "$f" $((off + 8))); len=$((11 + dl)); fl=11 ;;   # 0x14 pure data
+				21) len=$((9 + $(u24 "$f" $((off + 6))))); dl=0 ;;            # 0x15 direct recording
+				32|35|36) len=3 ;;
+				34|37|39) len=1 ;;
+				33|48) len=$((2 + $(u8 "$f" $((off + 1))))) ;;
+				38) len=$((3 + 2 * $(u16 "$f" $((off + 1))))) ;;
+				40|50) len=$((3 + $(u16 "$f" $((off + 1))))) ;;
+				43) len=6 ;;
+				49) len=$((3 + $(u8 "$f" $((off + 2))))) ;;
+				51) len=$((2 + 3 * $(u8 "$f" $((off + 1))))) ;;
+				52) len=9 ;;
+				53) len=$((21 + $(u32 "$f" $((off + 17))))) ;;
+				64) len=$((5 + $(u24 "$f" $((off + 2))))) ;;
+				90) len=10 ;;
+				*) len=$((5 + $(u32 "$f" $((off + 1))))) ;;
+			esac
+			[ $((off + len)) -gt "$size" ] && break
+			if [ "$dl" -eq 27 ] && [ "$fl" -gt 0 ] && [ "$(u8 "$f" $((off + fl)))" -eq 0 ]; then
+				echo "$off $len H $(hexs "$f" $((off + fl + 2)) 10)"
+			elif [ "$dl" -ge 0 ]; then
+				echo "$off $len D -"
+			else
+				echo "$off $len O -"
+			fi
+			off=$((off + len))
+		done
+	fi
+}
+
+# merge_pair TAPE FORMAT HEADER_FILE DATA_FILE NAMEHEX: replace by name, else append
+merge_pair() {
+	local w=$1 fmt=$2 hf=$3 df=$4 name=$5 start=0 size o l k n
+	local hoff=-1 hend=0 doff=-1 dend=0
+	[ "$fmt" = 1 ] && start=10
+	size=$(fsize "$w")
+	while read -r o l k n; do
+		if [ "$hoff" -lt 0 ]; then
+			[ "$k" = H ] && [ "$n" = "$name" ] && { hoff=$o; hend=$((o + l)); }
+		elif [ "$k" = D ]; then
+			doff=$o; dend=$((o + l)); break
+		elif [ "$k" = H ]; then
+			break
+		fi
+	done < <(blocks "$w" "$fmt" "$start")
+
+	if [ "$hoff" -lt 0 ]; then
+		cat "$w" "$hf" "$df" > "$w.new"
+	elif [ "$doff" -lt 0 ]; then
+		{ range "$w" 0 "$hoff"; cat "$hf" "$df"; range "$w" "$hend" $((size - hend)); } > "$w.new"
+	else
+		{ range "$w" 0 "$hoff"; cat "$hf"; range "$w" "$hend" $((doff - hend)); cat "$df"; range "$w" "$dend" $((size - dend)); } > "$w.new"
+	fi
+	mv "$w.new" "$w"
+	[ "$hoff" -ge 0 ]
+}
+
+# is_tape CRC LEN FILE: FILE has the cksum of the tape the core loaded
+is_tape() {
+	local c s
+	read -r c s _ < <(cksum "$3")
+	[ "$c" = "$1" ] && [ "$s" = "$2" ]
+}
+
+# find_tape CRC LEN: the inserted tape file
+find_tape() {
+	local f pid
+	# Main_MiSTer keeps the mounted tape open: use its path
+	for pid in $(pidof MiSTer); do
+		for f in /proc/"$pid"/fd/*; do
+			f=$(readlink "$f")
+			case $f in
+				"$PREV"/*) ;;
+				*.[tT][aA][pP]|*.[tT][zZ][xX]) [ -f "$f" ] && is_tape "$1" "$2" "$f" && { echo "$f"; return 0; } ;;
+			esac
+		done
+	done
+	# otherwise any tape in games/JupiterACE with the same contents
+	while IFS= read -r f; do
+		is_tape "$1" "$2" "$f" && { echo "$f"; return 0; }
+	done < <(find "$GAMES" -path "$PREV" -prune -o -type f \( -iname '*.tap' -o -iname '*.tzx' \) -print)
+	return 1
+}
+
+# done_mark OFFSET STATE: answer the core about the data whose header is at
+# OFFSET in boot1.vhd: 3 = handled, 4 = failed (the core shows it on the OSD)
+done_mark() { printf "\\00$2" | dd of="$VHD" bs=1 seek=$(($1 + 12)) count=1 conv=notrunc 2>/dev/null; }
+
+# safe_name NAME: an Ace program name as a file name
+safe_name() {
+	local n
+	n=$(printf '%s' "$1" | sed 's/ *$//; s/^ *//; s/[^A-Za-z0-9._-]/_/g')
+	echo "${n:-tape}"
+}
+
+# merge_save: merge the programs saved in the tape save area of boot1.vhd into
+# the inserted tape, or into a new <program name>.tap for a new tape
+# (0 = done, 1 = failed, 2 = nothing to do)
+merge_save() {
+	local h=$WORK/sav_hdr ext fmt crc ilen plen newt token name target key rel dir fname ts o l k n hdr cnt=0 rep=0 created=
+	[ -f "$VHD" ] || return 2
+	[ "$(fsize "$VHD")" -ge $((SAV_OFF + 512)) ] || return 2
+	mkdir -p "$WORK"
+	range "$VHD" "$SAV_OFF" 512 > "$h"
+	[ "$(head -c 8 "$h" | tr -d '\000')" = "JACESAV1" ] || return 2
+	[ "$(u8 "$h" 12)" -eq 2 ] || return 2
+	fmt=$(u8 "$h" 13); newt=$(u8 "$h" 14); crc=$(u32 "$h" 16); ilen=$(u32 "$h" 20); plen=$(u32 "$h" 24)
+	token=$(u32 "$h" 40); name=$(range "$h" 28 10 | tr -d '\000' | sed 's/ *$//')
+	if [ "$(fsize "$VHD")" -lt $((SAV_OFF + 512 + plen)) ]; then
+		log "boot1.vhd: bad tape save length $plen"; return 1
+	fi
+
+	if [ "$newt" = 1 ]; then key="new $token"; else key="$crc $ilen"; fi
+	target=$([ -f "$MAP" ] && awk -F'|' -v k="$key" '$1 == k { p = substr($0, length(k) + 2) } END { print p }' "$MAP")
+	if [ -z "$target" ] || [ ! -f "$target" ]; then
+		if [ "$newt" = 1 ]; then
+			# a new tape: named after the program saved on it, never over another file;
+			# .tap or .tzx as chosen in the OSD "New Tape Format"
+			ext=tap; [ "$fmt" = 1 ] && ext=tzx
+			o="$GAMES/$(safe_name "$name")"; target="$o.$ext"; n=1
+			while [ -e "$target" ]; do n=$((n + 1)); target="${o}_$n.$ext"; done
+			mkdir -p "$GAMES" || { log "cannot create $GAMES"; return 1; }
+			if [ "$fmt" = 1 ]; then
+				# TZX file header: "ZXTape!", 0x1A, version 1.20
+				printf 'ZXTape!\032\001\024' > "$target" || { log "cannot create $target"; return 1; }
+			else
+				: > "$target" || { log "cannot create $target"; return 1; }
+			fi
+			created=1
+		elif ! target=$(find_tape "$crc" "$ilen"); then
+			log "cannot find the inserted tape (it was changed or moved); not saved"
+			return 1
+		fi
+		echo "$key|$target" >> "$MAP"
+	fi
+
+	case $target in
+		"$GAMES"/*)
+			rel=${target#"$GAMES"/}
+			dir=$PREV/$(dirname "$rel"); [ "$(dirname "$rel")" = . ] && dir=$PREV ;;
+		*)	rel=$target; dir=$(dirname "$target")/previous ;;
+	esac
+	# archive the current version (a tape created just now has none)
+	if [ -z "$created" ]; then
+		fname=$(basename "$target")
+		ts=$(date +%Y%m%d_%H%M%S)
+		mkdir -p "$dir" || { log "cannot create $dir"; return 1; }
+		o="$dir/${fname%.*}_$ts"; n=1
+		while [ -e "$o.${fname##*.}" ]; do n=$((n + 1)); o="$dir/${fname%.*}_${ts}_$n"; done
+		cp "$target" "$o.${fname##*.}" || { log "cannot archive $target"; return 1; }
+	fi
+
+	# merge every program saved since the tape was inserted, in order
+	range "$VHD" $((SAV_OFF + 512)) "$plen" > "$WORK/payload"
+	cp "$target" "$WORK/tape"
+	# a blank tape made of empty TAP blocks (e.g. two zero bytes): start from nothing
+	if [ "$fmt" = 0 ] && [ "$(tr -d '\000' < "$WORK/tape" | head -c 1 | wc -c)" -eq 0 ]; then
+		: > "$WORK/tape"
+	fi
+	hdr=
+	while read -r o l k n; do
+		if [ "$k" = H ]; then
+			range "$WORK/payload" "$o" "$l" > "$WORK/hdr"; hdr=$n
+		elif [ "$k" = D ] && [ -n "$hdr" ]; then
+			range "$WORK/payload" "$o" "$l" > "$WORK/data"
+			merge_pair "$WORK/tape" "$fmt" "$WORK/hdr" "$WORK/data" "$hdr" && rep=$((rep + 1))
+			cnt=$((cnt + 1)); hdr=
+		fi
+	done < <(blocks "$WORK/payload" "$fmt" 0)
+
+	if [ "$cnt" -eq 0 ]; then
+		log "no complete program in the tape save"
+		[ -n "$created" ] && rm -f "$target"
+		return 1
+	fi
+	cat "$WORK/tape" > "$target.tmp" && mv "$target.tmp" "$target" || { log "cannot write $target"; return 1; }
+	if [ -n "$created" ]; then
+		log "$rel: new tape, saved \"$name\""
+	else
+		log "$rel: saved $cnt program(s) ($rep replaced, $((cnt - rep)) added), last \"$name\"; old version in ${dir#"$GAMES"/}"
+	fi
+	return 0
+}
+
+# process: handle a tape save and answer the core
+process() {
+	merge_save
+	case $? in
+		0) done_mark "$SAV_OFF" 3 ;;
+		1) done_mark "$SAV_OFF" 4 ;;
+	esac
+}
+
+# make_vhd: create boot1.vhd, or extend an older, smaller one (0 = changed now)
+make_vhd() {
+	local have=0
+	[ -f "$VHD" ] && have=$(( $(fsize "$VHD") / 512 ))
+	[ "$have" -ge "$VHD_SECTORS" ] && return 1
+	mkdir -p "$GAMES" && dd if=/dev/zero of="$VHD" bs=512 seek="$have" count=$((VHD_SECTORS - have)) conv=notrunc 2>/dev/null
+	log "made $VHD $((VHD_SECTORS * 512)) bytes"
+	return 0
+}
+
+# make_files: boot1.vhd ready, and boot2.vhd of an earlier version gone (0 = boot1.vhd changed now)
+make_files() {
+	[ -f "$GAMES/boot2.vhd" ] && rm -f "$GAMES/boot2.vhd" && log "removed $GAMES/boot2.vhd (no longer used)"
+	make_vhd
+}
+
+# ---- Delete File ----
+# answer N: tell the core how the delete request went (3 = deleted, 4 = not)
+answer() { done_mark "$DEL_OFF" "$1"; }
+
+# delete_req: move the file picked in the OSD "Delete File" to previous/deleted/
+delete_req() {
+	local h=$WORK/del_hdr crc len f pid target rel dest base ext ts
+	[ -f "$VHD" ] && [ "$(fsize "$VHD")" -ge $((DEL_OFF + 512)) ] || return 0
+	mkdir -p "$WORK"
+	range "$VHD" "$DEL_OFF" 512 > "$h"
+	[ "$(head -c 8 "$h" | tr -d '\000')" = "JACEDEL1" ] || return 0
+	[ "$(u8 "$h" 12)" -eq 2 ] || return 0
+	crc=$(u32 "$h" 16); len=$(u32 "$h" 20)
+
+	# the picked file is open in Main_MiSTer: find it by its checksum
+	target=
+	for pid in $(pidof MiSTer); do
+		for f in /proc/"$pid"/fd/*; do
+			f=$(readlink "$f")
+			case $f in
+				"$PREV"/*) ;;
+				*.[tT][aA][pP]|*.[tT][zZ][xX]|*.[aA][cC][eE])
+					[ -f "$f" ] && is_tape "$crc" "$len" "$f" && { target=$f; break 2; } ;;
+			esac
+		done
+	done
+	if [ -z "$target" ]; then
+		log "Delete File: the picked file was not found (only .tap/.tzx/.ace outside previous/ are deleted)"
+		answer 4; return 0
+	fi
+
+	case $target in
+		"$GAMES"/*) rel=${target#"$GAMES"/}; dest=$PREV/deleted/$rel ;;
+		*)          rel=$target; dest=$(dirname "$target")/previous/deleted/$(basename "$target") ;;
+	esac
+	if [ -e "$dest" ]; then
+		ts=$(date +%Y%m%d_%H%M%S); base=${dest%.*}; ext=${dest##*.}
+		dest="${base}_$ts.$ext"
+	fi
+	if mkdir -p "$(dirname "$dest")" && mv "$target" "$dest"; then
+		log "Delete File: moved $rel to ${dest#"$GAMES"/}"
+		answer 3
+	else
+		log "Delete File: cannot move $rel"
+		answer 4
+	fi
+}
+
+# ---- snapshots ----
+
+# next_snap: the next free SNAPnnn.ace name (searching all subfolders but previous/)
+next_snap() {
+	local f n max=0
+	while IFS= read -r f; do
+		n=$(basename "$f"); n=${n:4}; n=${n%.*}
+		case $n in ''|*[!0-9]*) continue ;; esac
+		n=$((10#$n))
+		[ "$n" -gt "$max" ] && max=$n
+	done < <(find "$GAMES" -path "$PREV" -prune -o -type f -iname 'SNAP*.ace' -print)
+	printf '%s/SNAP%03d.ace' "$GAMES" $((max + 1))
+}
+
+# snap: copy a complete, not yet copied snapshot out of boot1.vhd and answer the core
+snap() {
+	local len out
+	[ -f "$VHD" ] || return 0
+	[ "$(head -c 8 "$VHD" | tr -d '\000')" = "JACESNP1" ] || return 0
+	[ "$(u8 "$VHD" 12)" -eq 2 ] || return 0
+	len=$(u32 "$VHD" 16)
+	if [ "$len" -lt 1 ] || [ $((512 + len)) -gt "$(fsize "$VHD")" ]; then
+		log "boot1.vhd: bad snapshot length $len"
+		done_mark 0 4; return 0
+	fi
+	out=$(next_snap)
+	range "$VHD" 512 "$len" > "$out.tmp" && mv "$out.tmp" "$out" || { log "cannot write $out"; done_mark 0 4; return 0; }
+	done_mark 0 3
+	log "snapshot saved as ${out#"$GAMES"/} ($len bytes)"
+}
+
+daemon() {
+	local m vm=
+	echo $$ > "$PID"
+	log "watching $VHD"
+	make_files && log "load the JupiterACE core again so it uses the new boot1.vhd"
+	while true; do
+		if [ -f "$VHD" ]; then
+			m=$(stat -c '%Y %s' "$VHD")
+			[ "$vm" != "$m" ] && { snap; process; delete_req; vm=$(stat -c '%Y %s' "$VHD"); }
+		fi
+		sleep 2
+	done
+}
+
+running() { [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; }
+
+start() {
+	if running; then echo "Already running."; return; fi
+	if command -v setsid >/dev/null; then
+		setsid bash "$SELF" daemon < /dev/null > /dev/null 2>&1 &
+	else
+		nohup bash "$SELF" daemon < /dev/null > /dev/null 2>&1 &
+	fi
+	sleep 1
+	if running; then echo "Started. Log: $LOG"; else echo "Failed to start."; fi
+}
+
+case "$1" in
+	daemon) daemon ;;
+	start)  start ;;
+	stop)   running && kill "$(cat "$PID")" && rm -f "$PID" && echo "Stopped." ;;
+	once)   process; snap; delete_req ;;
+	"")
+		make_files && echo "Made $VHD: load the JupiterACE core again before saving."
+		# earlier versions of this script had other names: drop their startup lines
+		if [ -f "$STARTUP" ]; then
+			for old in jupiterace_saved.sh JupiterAce_Setup.sh JupiterACE_Setup.sh; do
+				[ "$(basename "$SELF")" = "$old" ] && continue
+				if grep -qF "/$old\"" "$STARTUP"; then
+					grep -vF "/$old\"" "$STARTUP" > "$STARTUP.tmp" && cat "$STARTUP.tmp" > "$STARTUP"
+					rm -f "$STARTUP.tmp"
+					echo "Removed $old from $STARTUP"
+				fi
+			done
+		fi
+		# restart, so a watcher started by an earlier version is replaced
+		running && kill "$(cat "$PID")" && rm -f "$PID" && sleep 1
+		line="[ -f \"$SELF\" ] && bash \"$SELF\" start"
+		if ! grep -qF "$SELF" "$STARTUP" 2>/dev/null; then
+			mkdir -p "$(dirname "$STARTUP")"
+			[ -f "$STARTUP" ] || echo "#!/bin/sh" > "$STARTUP"
+			echo "$line" >> "$STARTUP"
+			echo "Added to $STARTUP"
+		fi
+		start
+		;;
+	*) echo "usage: $0 [start|stop|daemon|once]"; exit 1 ;;
+esac
