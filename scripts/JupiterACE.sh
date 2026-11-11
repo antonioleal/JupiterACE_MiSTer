@@ -1,4 +1,25 @@
 #!/bin/bash
+
+# Copyright 2026 Antonio Leal, Porto Salvo, Oeiras, Portugal
+# All rights reserved.
+#
+# Redistribution and use of this script, with or without modification, is
+# permitted provided that the following conditions are met:
+#
+# 1. Redistributions of this script must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+#
+#  THIS SOFTWARE IS PROVIDED BY THE AUTHOR "AS IS" AND ANY EXPRESS OR IMPLIED
+#  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+#  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO
+#  EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+#  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+#  PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+#  OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+#  WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+#  OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+#  ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 #============================================================================
 #  JupiterACE.sh - tape saves and snapshots for the JupiterACE core
 #
@@ -18,6 +39,10 @@
 #
 #  Snapshots: each new snapshot is copied to games/JupiterACE/SNAPnnn.ace,
 #  numbered after the highest SNAPnnn.ace found in any subfolder.
+#
+#  Save Dictionary: the core dumps all of memory into the snapshot area; the
+#  user's words are written as Forth source to games/JupiterACE/DICTnnn.fth
+#  (listed as the ROM's LIST would), ready to be spooled back.
 #
 #  Delete File: the file picked in the OSD is moved to
 #  games/JupiterACE/backup/deleted/ (same subfolder) and erased from there
@@ -363,19 +388,256 @@ delete_req() {
 	fi
 }
 
-# ---- snapshots ----
+# ---- dictionary as Forth source ----
+# DICT_AWK reads all of memory (0000-FFFF, ROM included, as "od -tu1" numbers)
+# and writes the user dictionary as Forth source that spools back, like xAce's
+# F7. Words are found from 3C51h (after the FORTH vocabulary word) to STKBOT
+# by their length fields. Colon, DEFINER and COMPILER words are listed exactly
+# as the ROM's LIST would (this copies LIST's code: L1672-L17FB in the ROM);
+# variables and constants are written with their value, other words as
+# CREATE with their bytes. Words that use newer ones come after them, and
+# links, flags and the newest word's length field that re-spooling would not
+# reproduce are set at the end. Exit status 3: no words.
+# (BusyBox awk reads "name (" as a function call: never follow a variable by a bracket)
+DICT_AWK='
+function w(a) { return mem[a % 65536] + 256 * mem[(a + 1) % 65536] }
+function s16(v) { return v >= 32768 ? v - 65536 : v }
 
-# next_snap: the next free SNAPnnn.ace name (searching all subfolders but backup/)
-next_snap() {
-	local f n max=0
+# ---- LIST: printing ----
+function emit(c,   t) {
+	if (c == 13) { LN[nl++] = cur; cur = "" }
+	else { t = (c >= 32 && c < 127) ? CH[c] : " "; cur = cur t }
+}
+function emits(s) { cur = cur s }
+function prstr(p,   c, n) {                 # pr_string_sp: up to the bit-7 character, then a space
+	for (n = 0; n < 80; n++) {
+		c = mem[p]; emit(c % 128)
+		if (c >= 128) break
+		p = (p + 1) % 65536
+	}
+	emit(32)
+}
+function prname(de,   h, a, len, p, n) {    # L17E4: the name of the word whose code field is at de
+	h = (de + 65535) % 65536; a = mem[h]
+	if (a < 128) {                         # a header: name before the link (and length field in RAM)
+		len = a % 64; if (h >= 15360) len += 2
+		p = (h - 2 - len + 65536) % 65536
+	} else {                               # compiled by a COMPILER word: skip its inline bytes
+		n = mem[(h + 65534) % 65536]
+		if (n == 255) { n = w(bc); bc += 2 }
+		bc += n
+		p = (w((h + 65535) % 65536) + h) % 65536
+	}
+	prstr(p)
+}
+function indent(   i) {                     # L17C1: new line and indentation for a line'"'"'s first word
+	if (ind3 >= 128) return
+	emit(13); for (i = 0; i < ind3; i++) emit(32)
+	ind3 = 255
+}
+function printfloat(v1, v2,   e, m0, m1, m2, s, E, a, z, d) {   # F. (L0AB1)
+	m2 = v1 % 256; m1 = int(v1 / 256); m0 = v2 % 256; e = int(v2 / 256)
+	s = ""; if (e >= 128) { s = "-"; e -= 128 }
+	E = 0; a = (e + 255) % 256
+	if (a >= 73 || a < 60) { e = 65; E = (a + 1) % 256 }
+	if (e <= 64) { s = s "."; for (z = 0; z < 64 - e; z++) s = s "0" }
+	for (z = 0; z < 40; z++) {
+		if (e <= 64 && m0 == 0 && m1 == 0 && m2 == 0) break
+		d = int(m0 / 16)
+		m0 = (m0 % 16) * 16 + int(m1 / 16); m1 = (m1 % 16) * 16 + int(m2 / 16); m2 = (m2 % 16) * 16
+		e--; s = s d
+		if (e == 64) s = s "."
+	}
+	if (E == 0) s = s " "; else s = s "E" (E - 65) " "
+	emits(s)
+}
+function line(   de, k, v1, v2, sb, n, i, ch) {   # L1708: one line, up to 5 words
+	ind3 = ind2; cnt = 5
+	while (1) {
+		if (++guard > 20000) { bad = 1; return 1 }
+		de = w(bc); bc += 2
+		k = KIND[de]
+		if (k == "in")       { ind3 = ind2; ind2 = (ind2 + 1) % 256; cnt = 1 }
+		else if (k == "mid") { ind3 = (ind2 + 255) % 256; cnt = 1 }
+		else if (k == "out") { ind2 = (ind2 + 255) % 256; ind3 = ind2; cnt = 1 }
+		if (k == "lit")  { v1 = w(bc); bc += 2; indent(); emits(s16(v1) " ") }
+		else if (k == "flit") { v1 = w(bc); bc += 2; v2 = w(bc); bc += 2; indent(); printfloat(v1, v2) }
+		else if (k == "ascii") { ch = mem[bc % 65536]; indent(); prname(de); emit(ch); emit(32) }
+		else if (k == "paren" || k == "dotq") {
+			sb = bc; indent(); prname(de)
+			n = w(sb); for (i = 0; i < n && i < 4096; i++) emit(mem[(sb + 2 + i) % 65536])
+			emit(k == "paren" ? 41 : 34)
+			return 0
+		}
+		else if (k == "exit") { emit(13); emit(59); emit(13); emit(32); return 1 }
+		else { indent(); prname(de) }
+		if (--cnt == 0) return 0
+	}
+}
+function listword(i,   cfa, cf, a, b, j, s) {     # LIST (L1672)
+	cur = ""; nl = 0; guard = 0; bad = 0
+	cfa = WN[i] + 1; cf = w(cfa)
+	emit(13)
+	if (cf == 4360) { a = w(cfa + 2); b = mem[(a + 65533) % 65536]; emits((b >= 128 ? b - 256 : b) " ") }
+	bc = cfa; prname(cf)
+	bc = cfa + (cf == 3779 ? 2 : 4); prname(cfa)
+	ind2 = 1
+	while (1) if (line()) break
+	emit(13)
+	if (bad || bc > WE[i]) return 0
+	for (j = 0; j < nl; j++) { s = LN[j]; sub(/ +$/, "", s); if (s != "") print s }
+	return 1
+}
+
+# ---- the words ----
+function holding(a,   i) { for (i = 0; i < nw; i++) if (a >= WS[i] && a < WE[i]) return i; return -1 }
+function address(a,   o, off) {               # an address relative to the word holding it
+	o = a >= 15441 ? holding(a) : -1
+	if (o < 0) return s16(a) ""
+	off = a - (WN[o] + 1)
+	return off == 0 ? "find " NAME[o] : "find " NAME[o] " " off " +"
+}
+function as_bytes(i,   a, n, s, cf) {
+	print "create " NAME[i]
+	n = 0; s = ""
+	a = WN[i] + 3
+	while (a < WE[i]) {
+		if (a + 1 < WE[i]) { s = s s16(w(a)) " , "; a += 2 }
+		else { s = s mem[a] " c, "; a++ }
+		n++
+		if (n == 4) { print s; s = ""; n = 0 }
+	}
+	if (n > 0) print s
+	cf = w(WN[i] + 1)
+	if (cf != 4076) print address(cf) " find " NAME[i] " !"
+	asbytes++
+}
+
+BEGIN {
+	for (i = 32; i < 127; i++) CH[i] = sprintf("%c", i)
+	# LIST'"'"'s table at L171B: control words change the indentation; others have inline data
+	KIND[4739] = "in";  KIND[4767] = "in";  KIND[4899] = "in"              # IF BEGIN DO
+	KIND[4721] = "mid"; KIND[4744] = "mid"; KIND[4328] = "mid"; KIND[4416] = "mid"   # ELSE WHILE DOES> RUNS>
+	KIND[4772] = "out"; KIND[4749] = "out"; KIND[4726] = "out"; KIND[4914] = "out"; KIND[4924] = "out"  # THEN UNTIL REPEAT LOOP +LOOP
+	KIND[4113] = "lit"; KIND[4196] = "flit"; KIND[4171] = "ascii"
+	KIND[4985] = "paren"; KIND[5014] = "dotq"; KIND[1206] = "exit"
+	n = 0
+}
+{ for (i = 1; i <= NF; i++) mem[n++] = $i + 0 }
+END {
+	stkbot = w(15415)
+	nw = 0; st = 15441
+	while (st < stkbot && nw < 2048) {
+		last = st
+		while (last < stkbot && mem[last] < 128 && last - st < 63) last++
+		nlen = last - st + 1; nlf = last + 5
+		if (last >= stkbot || mem[last] < 128 || nlf + 3 > stkbot || mem[nlf] % 64 != nlen) break
+		s = ""
+		for (i = 0; i < nlen; i++) { c = mem[st + i] % 128; t = (c >= 32 && c < 127) ? CH[c] : "?"; s = s t }
+		NAME[nw] = s; WS[nw] = st; WN[nw] = nlf
+		WL[nw] = w(last + 1); WK[nw] = w(last + 3); WF[nw] = mem[nlf]
+		e = st + WL[nw] + nlen
+		WE[nw] = (WL[nw] != 0 && e > nlf + 2 && e <= stkbot) ? e : stkbot
+		CFAIDX[nlf + 1] = nw + 1
+		st = WE[nw]; nw++
+	}
+	if (nw == 0) exit 3
+
+	# words a word uses: code field addresses in its parameter field, and the word holding its code field
+	nd = 0
+	for (i = 0; i < nw; i++) {
+		DF[i] = nd; DN[i] = 0; DONE[i] = 0
+		cf = w(WN[i] + 1); o = cf >= 15441 ? holding(cf) : -1
+		if (o >= 0 && o != i) { DEP[nd++] = o; DN[i]++ }
+		for (a = WN[i] + 3; a + 1 < WE[i] && nd < 8192; a++) {
+			u = CFAIDX[w(a)] - 1
+			if (u >= 0 && u != i) { DEP[nd++] = u; DN[i]++ }
+		}
+	}
+	reordered = 0
+	for (n = 0; n < nw; n++) {
+		ch = -1; old = -1
+		for (i = 0; i < nw && ch < 0; i++) {
+			if (DONE[i]) continue
+			if (old < 0) old = i
+			ok = 1
+			for (d = 0; d < DN[i] && ok; d++) ok = DONE[DEP[DF[i] + d]]
+			if (ok) ch = i
+		}
+		if (ch < 0) ch = old
+		DONE[ch] = 1; ORD[n] = ch
+		if (ch != n) reordered = 1
+	}
+
+	print "decimal"
+	for (n = 0; n < nw; n++) {
+		i = ORD[n]; cf = w(WN[i] + 1); par = WN[i] + 3; one = (WE[i] == par + 2)
+		if (cf == 3779 || cf == 4229 || cf == 4360) { if (listword(i)) listed++; else as_bytes(i) }
+		else if (cf == 4080 && one) print s16(w(par)) " variable " NAME[i]
+		else if (cf == 4085 && one) print s16(w(par)) " constant " NAME[i]
+		else as_bytes(i)
+	}
+
+	# what re-spooling would not reproduce
+	if (WL[nw - 1] != 0 && !reordered) print s16(WL[nw - 1]) " find " NAME[nw - 1] " 5 - !"
+	for (n = 0; n < nw; n++) {
+		i = ORD[n]; want = (i == 0) ? 15433 : WN[i - 1]
+		if (WK[i] != want) {
+			t = CFAIDX[WK[i] + 1] - 1
+			if (WK[i] == 0 || WK[i] == 15433 || t < 0) lk = s16(WK[i]) ""
+			else lk = "find " NAME[t] " 1-"
+			print lk " find " NAME[i] " 3 - !"
+		}
+		if (int(WF[i] / 64) != 0) print WF[i] " find " NAME[i] " 1- c!"
+	}
+	extra = ""
+	if (reordered) extra = ", reordered"
+	summary = nw " words (" (listed + 0) " listed, " (asbytes + 0) " as bytes" extra ")"
+	print summary > "/dev/stderr"
+}'
+
+# next_name PREFIX EXT: the next free PREFIXnnn.EXT (searching all subfolders but backup/)
+next_name() {
+	local f n max=0 p=$1 e=$2
 	while IFS= read -r f; do
-		n=$(basename "$f"); n=${n:4}; n=${n%.*}
+		n=$(basename "$f"); n=${n:${#p}}; n=${n%.*}
 		case $n in ''|*[!0-9]*) continue ;; esac
 		n=$((10#$n))
 		[ "$n" -gt "$max" ] && max=$n
-	done < <(find "$GAMES" -path "$PREV" -prune -o -type f -iname 'SNAP*.ace' -print)
-	printf '%s/SNAP%03d.ace' "$GAMES" $((max + 1))
+	done < <(find "$GAMES" -path "$PREV" -prune -o -type f -iname "$p*.$e" -print)
+	printf '%s/%s%03d.%s' "$GAMES" "$p" $((max + 1)) "$e"
 }
+
+# dict: write the dictionary dump in the snapshot area as DICTnnn.fth
+dict() {
+	local len out info rc
+	len=$(u32 "$VHD" 16)
+	if [ "$len" -ne 65536 ] || [ $((512 + len)) -gt "$(fsize "$VHD")" ]; then
+		log "boot1.vhd: bad dictionary dump length $len"
+		done_mark 0 4; return 0
+	fi
+	mkdir -p "$WORK"
+	out=$(next_name DICT fth)
+	range "$VHD" 512 65536 | od -An -v -tu1 | awk "$DICT_AWK" > "$out.tmp" 2> "$WORK/dict_info"
+	rc=$?
+	info=$(cat "$WORK/dict_info")
+	if [ "$rc" -eq 3 ]; then
+		rm -f "$out.tmp"; log "Save Dictionary: there are no words to save"
+		done_mark 0 4; return 0
+	fi
+	if [ "$rc" -ne 0 ]; then
+		rm -f "$out.tmp"; log "Save Dictionary failed (awk exit $rc): $(head -c 300 "$WORK/dict_info" | tr '\n' ' ')"
+		done_mark 0 4; return 0
+	fi
+	if ! mv "$out.tmp" "$out"; then
+		rm -f "$out.tmp"; log "Save Dictionary: cannot write $out"
+		done_mark 0 4; return 0
+	fi
+	done_mark 0 3
+	log "dictionary saved as ${out#"$GAMES"/}: $info"
+}
+
+# ---- snapshots ----
 
 # snap: copy a complete, not yet copied snapshot out of boot1.vhd and answer the core
 snap() {
@@ -383,12 +645,13 @@ snap() {
 	[ -f "$VHD" ] || return 0
 	[ "$(head -c 8 "$VHD" | tr -d '\000')" = "JACESNP1" ] || return 0
 	[ "$(u8 "$VHD" 12)" -eq 2 ] || return 0
+	[ "$(u8 "$VHD" 13)" -eq 1 ] && { dict; return 0; }
 	len=$(u32 "$VHD" 16)
 	if [ "$len" -lt 1 ] || [ $((512 + len)) -gt "$(fsize "$VHD")" ]; then
 		log "boot1.vhd: bad snapshot length $len"
 		done_mark 0 4; return 0
 	fi
-	out=$(next_snap)
+	out=$(next_name SNAP ace)
 	range "$VHD" 512 "$len" > "$out.tmp" && mv "$out.tmp" "$out" || { log "cannot write $out"; done_mark 0 4; return 0; }
 	done_mark 0 3
 	log "snapshot saved as ${out#"$GAMES"/} ($len bytes)"

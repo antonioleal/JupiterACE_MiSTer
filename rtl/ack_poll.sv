@@ -22,6 +22,7 @@ module ack_poll
 	input             clk,
 
 	input             snap_done,   // pulse: snapshot written
+	input             snap_dict,   // ... and it was a dictionary dump
 	input             tape_done,   // pulse: tape save written
 
 	input             other_busy,  // another module is using slot 1
@@ -44,11 +45,14 @@ localparam INFO_SNAP_OK   = 8'd6;
 localparam INFO_NOSCRIPT  = 8'd11;
 localparam INFO_TAPE_FAIL = 8'd13;
 localparam INFO_SNAP_FAIL = 8'd14;
+localparam INFO_DICT_OK   = 8'd19;
+localparam INFO_DICT_FAIL = 8'd20;
 
 localparam SNAP_LBA = 32'd0;
 localparam TAPE_LBA = 32'd257;
 
 reg        pend_s = 0, pend_t = 0;  // waiting for an answer
+reg        dict_s;                  // the snapshot area holds a dictionary dump
 reg  [3:0] cnt_s, cnt_t;            // checks so far
 reg        tgt;                     // 0 = snapshot, 1 = tape
 reg  [7:0] answer;
@@ -63,7 +67,7 @@ assign busy = (state != S_WAIT);
 always @(posedge clk) begin
 	info_req <= 0;
 
-	if(snap_done) begin pend_s <= 1; cnt_s <= 0; end
+	if(snap_done) begin pend_s <= 1; cnt_s <= 0; dict_s <= snap_dict; end
 	if(tape_done) begin pend_t <= 1; cnt_t <= 0; end
 
 	case(state)
@@ -108,8 +112,8 @@ always @(posedge clk) begin
 				state <= S_WAIT;
 				if(!tgt && !snap_done) begin
 					cnt_s <= cnt_s + 1'd1;
-					if(answer == 8'd3)      begin info <= INFO_SNAP_OK;   info_req <= 1; pend_s <= 0; end
-					else if(answer == 8'd4) begin info <= INFO_SNAP_FAIL; info_req <= 1; pend_s <= 0; end
+					if(answer == 8'd3)      begin info <= dict_s ? INFO_DICT_OK : INFO_SNAP_OK;     info_req <= 1; pend_s <= 0; end
+					else if(answer == 8'd4) begin info <= dict_s ? INFO_DICT_FAIL : INFO_SNAP_FAIL; info_req <= 1; pend_s <= 0; end
 					else if(cnt_s == 4'd12) begin info <= INFO_NOSCRIPT;  info_req <= 1; pend_s <= 0; end
 				end
 				if(tgt && !tape_done) begin

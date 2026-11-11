@@ -10,6 +10,10 @@
 - Saves to tape with `SAVE` / `BSAVE`: onto the inserted tape (replacing a
   program with the same name, with backups of the old version), or onto a new
   `.tap` or `.tzx` tape named after the program; optional 8x fast save
+- Spools Forth source files (`.fth`, `.fs`, `.f`) into the Ace, typed 8x
+  faster than by hand
+- Saves the dictionary as a Forth source file (DICT001.fth, ...) that spools
+  back
 - Deletes `.tap`, `.tzx` and `.ace` files from the OSD (recoverable for 30 days)
 
 ### Install
@@ -17,8 +21,9 @@
 2. Put your .ace, .tap and .tzx files in `games/JupiterACE/`; subfolders are
    fine.
 
-Loading works with just these two steps. Saving to tape, saving snapshots
-and deleting files also need the helper script, installed once:
+Loading and spooling work with just these two steps. Saving to tape, saving
+snapshots, saving the dictionary and deleting files also need the helper
+script, installed once:
 
 3. Copy `scripts/JupiterACE.sh` to `/media/fat/Scripts/`.
 4. On the MiSTer, open the OSD **Scripts** menu and run `JupiterACE`.
@@ -143,6 +148,45 @@ How it works: the core writes each snapshot into `games/JupiterACE/boot1.vhd`,
 reusing the same space every time, so the file never grows; the script copies
 each new snapshot out as the next SNAPnnn.ace.
 
+### Spooling Forth source
+OSD → **Spool Forth File** and pick a `.fth`, `.fs` or `.f` file: it is typed
+into the Ace line by line, as if from the keyboard, and each line is run or
+compiled before the next one. The Ace runs 8 times faster while spooling, so
+it takes about 12 seconds per 1000 characters. Close the OSD to watch it.
+
+- `( ... )` comments outside definitions are left out (the Ace would answer
+  them with ERROR 4); comments inside definitions are kept, so `LIST` shows
+  them. Text in `." ..."` and the character after `ASCII` are typed as they are.
+- Empty lines are skipped, tabs become spaces, and `£` and `©` are typed as the
+  Ace's own characters. Other characters the Ace does not have are skipped.
+- Caps lock, graphics and inverse mode are switched off first.
+- An `ERROR n` does not stop spooling. A line the Ace does not accept does: it
+  is left in the editor, so you can see what is wrong.
+- The keyboard is ignored while spooling, except **Esc**, which stops it
+  (as does OSD → **Stop Spool**).
+
+At the end the OSD shows "Spool done", "Spool done with errors", "Spool
+stopped: line not OK" or "Spool stopped".
+
+### Saving the dictionary
+OSD → **Save Dictionary** closes the OSD and saves the words you have defined
+as Forth source in `games/JupiterACE/DICTnnn.fth`: DICT001.fth, DICT002.fth,
+... numbered after the highest DICTnnn.fth in `games/JupiterACE` and its
+subfolders. Spool the file back to get the words again. The OSD shows
+"Dictionary saved" when done.
+
+- Words defined with `:`, `DEFINER` and `COMPILER` are written exactly as `LIST`
+  shows them.
+- Variables and constants are written with their current value, other words
+  (`CREATE`, machine code, data) as `create` with their bytes.
+- If a word uses a newer word (after `REDEFINE`), it is written after it.
+- The file starts with `decimal` and ends with a few lines that restore what
+  re-spooling alone would not (links and flags of the words).
+
+How it works: the core stops the Ace for a moment and writes all of memory
+into `games/JupiterACE/boot1.vhd`; the script turns the words into Forth
+source. The Ace itself is not changed.
+
 ### Deleting files
 OSD → **Delete File** opens a file browser for `.tap`, `.tzx` and `.ace` files.
 The file you pick is moved to `games/JupiterACE/backup/deleted/` (same
@@ -164,12 +208,18 @@ Messages appear while the OSD is closed.
 | Save failed: run JupiterACE.sh | `boot1.vhd` is missing: install the script, then load the core again. |
 | Tape save failed: see log | The script could not update the tape (for example, the tape file was moved). |
 | Snapshot saved | The snapshot was saved as the next SNAPnnn.ace. |
-| Snapshot: run JupiterACE.sh | `boot1.vhd` is missing: install the script, then load the core again. |
+| Snapshot: run JupiterACE.sh | `boot1.vhd` is missing: install the script, then load the core again (also for **Save Dictionary**). |
 | Snapshot failed: CPU busy | The Ace could not be stopped (for example, during a reset). Try again. |
 | Snapshot failed: see log | The script could not write the snapshot file. |
 | File deleted | The file was moved to `backup/deleted/`. |
 | Delete failed: see log | The script could not find or move the file. |
 | Delete: run JupiterACE.sh | `boot1.vhd` is missing: install the script, then load the core again. |
+| Spool done | The whole file was typed. |
+| Spool done with errors | The whole file was typed, but some lines gave an `ERROR n`. |
+| Spool stopped: line not OK | The Ace did not accept a line; it is left in the editor. |
+| Spool stopped | Stopped with **Esc** or **Stop Spool**. |
+| Dictionary saved | The words were saved as the next DICTnnn.fth. |
+| Dictionary failed: see log | There were no words to save, or the script could not write the file. |
 | JupiterACE.sh not running | The script did not answer: run `JupiterACE` from the OSD **Scripts** menu. |
 
 "See log" means `/tmp/jupiterace_saved.log` on the MiSTer says why.

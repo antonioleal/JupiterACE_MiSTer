@@ -40,6 +40,14 @@ module ace
 	output       tape_save, // CPU is running the ROM SAVE routine
 	output reg [7:0] name0, // first character of the tape name LOAD/SAVE was given
 
+	// writes to the system variables 3C00-3C3F (by the CPU or the snapshot loader)
+	output       sv_we,
+	output [5:0] sv_addr,
+	output [7:0] sv_data,
+
+	input        int_fast,   // spooling: frame interrupt from int_fast_n, not vsync
+	input        int_fast_n,
+
 	input        loader_en,
 	input [15:0] loader_addr,
 	input  [7:0] loader_data,
@@ -66,6 +74,10 @@ wire rom_enable  = mem_on && (addr[15:13] == 0);       // 0000 - 1FFF 8KB
 wire sram_enable = mem_on && (addr[15:11] == 'b00100); // 2000 - 27FF 1KB * 2
 wire cram_enable = mem_on && (addr[15:11] == 'b00101); // 2800 - 2FFF 1KB * 2
 wire uram_enable = mem_on && (addr[15:12] == 'b0011);  // 3000 - 3FFF 1KB * 4
+
+assign sv_we   = ram_we & mem_on & (addr[15:6] == 10'b0011_1100_00);
+assign sv_addr = addr[5:0];
+assign sv_data = data;
 wire xram_enable = mem_on && (addr[15:14] == 'b01);    // 4000 - 7FFF 16KB
 wire eram_enable = mem_on && (addr[15]);               // 8000 - FFFF 32KB
 
@@ -157,15 +169,15 @@ wire [7:0] rom_dout;
 dpram #(.ADDRWIDTH(13), .MEM_INIT_FILE("rtl/ace.mif")) rom
 (
 	.clock(clk),
-	.address_a(cpu_addr[12:0]),
+	.address_a(snap_en ? snap_addr[12:0] : cpu_addr[12:0]),
 	.oe_a_n(~rom_enable),
 	.q_a(rom_dout)
 );
 
-// snapshot reads: the character RAM, or the other RAMs (ROM is never read here)
+// snapshot reads: the character RAM, or the other RAMs and the ROM
 reg snap_cram;
 always @(posedge clk) snap_cram <= (snap_addr[15:11] == 'b00101);
-assign snap_data = snap_cram ? cram_q : (sram_dout & uram_dout & xram_dout & eram_dout);
+assign snap_data = snap_cram ? cram_q : (rom_dout & sram_dout & uram_dout & xram_dout & eram_dout);
 
 wire  [7:0] cpu_dout;
 wire [15:0] cpu_addr;
@@ -180,7 +192,7 @@ T80pa cpu
 	.CEN_p(ce_cpu),
 
 	.WAIT_n(wait_n),
-	.INT_n(vsync),
+	.INT_n(int_fast ? int_fast_n : vsync),
 	.M1_n(m1_n),
 	.HALT_n(halt_n),
 	.MREQ_n(mreq_n),

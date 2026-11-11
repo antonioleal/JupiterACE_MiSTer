@@ -59,6 +59,7 @@ parameter CONF_STR = {
 	"-;",
 	"F1,ACE,Load Snapshot;",
 	"RE,Save Snapshot;",
+	"RL,Save Dictionary;",
 	"S0,TAPTZX,Insert Tape;",
 	"TG,Eject Tape;",
 	"TC,Tape Play/Pause;",
@@ -70,6 +71,9 @@ parameter CONF_STR = {
 	"OH,Tape Fast Save,Off,On;",
 	"OI,New Tape Format,TAP,TZX;",
 	"-;",
+	"S3,FTHFS F,Spool Forth File;",
+	"TK,Stop Spool;",
+	"-;",
 	"S2,TAPTZXACE,Delete File;",
 	"-;",
 	"O89,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
@@ -79,7 +83,7 @@ parameter CONF_STR = {
 	"O45,CPU Speed,Normal,x2,x4;",
 	"R0,Reset;",
 	"J,Fire;",
-	"I,Tape saved,New tape created,Tape full: save discarded,Save failed: bad block,Save failed: run JupiterACE.sh,Snapshot saved,Snapshot: run JupiterACE.sh,Snapshot failed: CPU busy,File deleted,Delete failed: see log,JupiterACE.sh not running,Delete: run JupiterACE.sh,Tape save failed: see log,Snapshot failed: see log;",
+	"I,Tape saved,New tape created,Tape full: save discarded,Save failed: bad block,Save failed: run JupiterACE.sh,Snapshot saved,Snapshot: run JupiterACE.sh,Snapshot failed: CPU busy,File deleted,Delete failed: see log,JupiterACE.sh not running,Delete: run JupiterACE.sh,Tape save failed: see log,Snapshot failed: see log,Spool done,Spool done with errors,Spool stopped: line not OK,Spool stopped,Dictionary saved,Dictionary failed: see log;",
 	"V,v",`BUILD_DATE
 };
 
@@ -126,7 +130,7 @@ wire  [7:0] ioctl_dout;
 reg         ioctl_wait = 0;
 wire        forced_scandoubler;
 
-hps_io #(.CONF_STR(CONF_STR), .VDNUM(3)) hps_io
+hps_io #(.CONF_STR(CONF_STR), .VDNUM(4)) hps_io
 (
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
@@ -150,18 +154,18 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(3)) hps_io
 	.img_mounted(img_mounted),
 	.img_readonly(img_readonly),
 	.img_size(img_size),
-	.sd_lba('{tl_lba, f_lba, del_lba2}),
-	.sd_blk_cnt('{6'd0, 6'd0, 6'd0}),
-	.sd_rd({del_rd2, f_rd, tl_rd}),
-	.sd_wr({1'b0, f_wr, 1'b0}),
-	.sd_ack({del_ack2, f_ack, tl_ack}),
+	.sd_lba('{tl_lba, f_lba, del_lba2, sp_lba}),
+	.sd_blk_cnt('{6'd0, 6'd0, 6'd0, 6'd0}),
+	.sd_rd({sp_rd, del_rd2, f_rd, tl_rd}),
+	.sd_wr({2'b00, f_wr, 1'b0}),
+	.sd_ack({sp_ack, del_ack2, f_ack, tl_ack}),
 	.sd_buff_addr(sd_buff_addr),
 	.sd_buff_dout(sd_buff_dout),
-	.sd_buff_din('{8'h00, f_din, 8'h00}),
+	.sd_buff_din('{8'h00, f_din, 8'h00, 8'h00}),
 	.sd_buff_wr(sd_buff_wr),
 
-	.info_req(tape_msg | snap_msg | del_info_req | poll_info_req | new_start),
-	.info(new_start ? 8'd2 : tape_msg ? tape_info : snap_msg ? snap_info : del_info_req ? del_info : poll_info)
+	.info_req(tape_msg | snap_msg | del_info_req | poll_info_req | sp_info_req | new_start),
+	.info(new_start ? 8'd2 : tape_msg ? tape_info : snap_msg ? snap_info : del_info_req ? del_info : poll_info_req ? poll_info : sp_info)
 );
 
 // SD slot 0: tape image (S0 option)
@@ -169,7 +173,8 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(3)) hps_io
 //            sectors 0-256 snapshots, 257-513 tape saves, 514 delete
 //            requests. Only one of the three writers uses it at a time.
 // SD slot 2: the file picked in "Delete File" (S2 option)
-wire  [2:0] img_mounted;
+// SD slot 3: the file picked in "Spool Forth File" (S3 option)
+wire  [3:0] img_mounted;
 wire        img_readonly;
 wire [63:0] img_size;
 wire [31:0] sd_lba, snap_lba;
@@ -258,13 +263,21 @@ wire         snap_busy;
 wire ce_run = ce_cpu & ~snap_held;  // tape time stands still while the CPU is stopped
 
 reg old_snap_trig;
-always @(posedge clk_sys) old_snap_trig <= status[14];
+reg old_dict_trig;
+always @(posedge clk_sys) begin
+	old_snap_trig <= status[14];
+	old_dict_trig <= status[21];
+end
+wire snap_ok_now = ~ioctl_download & ~tape_dl & ~save_busy & ~del_busy;
+wire snap_dict;
 
 snap_save snap_save
 (
 	.clk(clk_sys),
 	.reset(reset),
-	.trig(~old_snap_trig & status[14] & ~ioctl_download & ~tape_dl & ~save_busy & ~del_busy),
+	.trig(~old_snap_trig & status[14] & snap_ok_now),
+	.trig_dict(~old_dict_trig & status[21] & snap_ok_now),
+	.dict(snap_dict),
 
 	.hold(snap_hold),
 	.held(snap_held),
@@ -309,6 +322,7 @@ ack_poll ack_poll
 (
 	.clk(clk_sys),
 	.snap_done(snap_done),
+	.snap_dict(snap_dict),
 	.tape_done(tape_done),
 	.other_busy(snap_busy | save_busy | save_req | del_busy),
 	.busy(poll_busy),
@@ -551,7 +565,7 @@ always @(posedge clk_sys) begin
 
 	if(wrap_on && tape_ready && ~old_end && tape_at_end) wrap_rw <= 1;
 end
-assign fast_load = (status[15] & tape_playing) | (status[17] & |save_timer);
+assign fast_load = (status[15] & tape_playing) | (status[17] & |save_timer) | sp_active;
 
 // Recorder: listen to MIC while the ROM SAVE routine is executing
 reg [16:0] save_timer = 0;
@@ -665,8 +679,15 @@ wire reset = RESET | status[0] | buttons[1];
 wire mic,spk;
 
 wire [7:0] kbd_row;
-wire [4:0] kbd_col;
+wire [4:0] kbd_col, kbd_col_kb, kbd_col_sp;
+assign kbd_col = sp_active ? kbd_col_sp : kbd_col_kb;   // the keyboard is ignored while spooling
 wire       video_out;
+
+// system variable writes (for the spooler) and the spooling frame interrupt
+wire        sv_we;
+wire  [5:0] sv_addr;
+wire  [7:0] sv_data;
+wire        int_fast, int_fast_n;
 
 ace ace
 (
@@ -676,7 +697,55 @@ ace ace
 	.reset(reset|loader_reset)
 );
 
-keyboard keyboard (.*);
+keyboard keyboard (.*, .kbd_col(kbd_col_kb));
+
+/////////////////  SPOOL  /////////////////////////
+
+wire [31:0] sp_lba;
+wire        sp_rd, sp_ack, sp_active;
+wire        sp_info_req;
+wire  [7:0] sp_info;
+// "Stop Spool", or Esc pressed on the keyboard
+reg  old_stop, old_ps2;
+wire esc_down  = (old_ps2 != ps2_key[10]) & ps2_key[9] & (ps2_key[7:0] == 8'h76);
+always @(posedge clk_sys) begin
+	old_stop <= status[20];
+	old_ps2  <= ps2_key[10];
+end
+
+spool spool
+(
+	.clk(clk_sys),
+	.reset(reset),
+	.img_mounted(img_mounted[3]),
+	.img_size(img_size),
+	.stop((~old_stop & status[20]) | esc_down),
+	.lba(sp_lba),
+	.rd(sp_rd),
+	.ack(sp_ack),
+	.sd_buff_addr(sd_buff_addr[8:0]),
+	.sd_buff_dout(sd_buff_dout),
+	.sd_buff_wr(sd_buff_wr),
+	.sv_we(sv_we),
+	.sv_addr(sv_addr),
+	.sv_data(sv_data),
+	.kbd_row(kbd_row),
+	.kbd_col(kbd_col_sp),
+	.active(sp_active),
+	.info_req(sp_info_req),
+	.info(sp_info)
+);
+
+// While spooling the CPU runs 8x, and the frame interrupt comes every 65000
+// CPU T-states (50 Hz of Ace time) instead of from the video, so the ROM's
+// key timing is unchanged and spooling is 8x faster.
+reg [15:0] int_cnt;
+assign int_fast   = sp_active;
+assign int_fast_n = (int_cnt >= 16'd256);
+always @(posedge clk_sys) begin
+	if(!sp_active) int_cnt <= 0;
+	else if(ce_run) int_cnt <= (int_cnt == 16'd64999) ? 16'd0 : int_cnt + 1'd1;
+end
 
 wire [1:0] scale = status[3:2];
 

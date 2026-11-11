@@ -20,8 +20,11 @@
 //      0  "JACESNP1"
 //      8  snapshot counter (LE32)
 //      12 state: 1 = being written, 2 = complete (the script sets 3 = copied)
-//      16 length of the .ACE data (LE32)
-//    sector 1+ : the .ACE data
+//      13 0 = snapshot, 1 = dictionary dump
+//      16 length of the data (LE32)
+//    sector 1+ : the .ACE data, or for a dictionary dump all of memory
+//                (0000-FFFF, ROM included) as it is, for JupiterACE.sh to
+//                write the dictionary as Forth source
 //
 //  This program is free software; you can redistribute it and/or modify it
 //  under the terms of the GNU General Public License as published by the Free
@@ -34,6 +37,8 @@ module snap_save
 	input             clk,
 	input             reset,
 	input             trig,         // pulse: take a snapshot
+	input             trig_dict,    // pulse: dump memory for "Save Dictionary"
+	output reg        dict,         // the last request was a dictionary dump
 
 	// CPU and memory
 	output reg        hold,         // stop the CPU at the next instruction boundary
@@ -129,6 +134,7 @@ always @(*) begin
 		4: hbyte = "S";  5: hbyte = "N";  6: hbyte = "P";  7: hbyte = "1";
 		8: hbyte = seq[7:0];   9: hbyte = seq[15:8];   10: hbyte = seq[23:16];   11: hbyte = seq[31:24];
 		12: hbyte = hstate;
+		13: hbyte = {7'd0, dict};
 		16: hbyte = olen[7:0]; 17: hbyte = olen[15:8]; 18: hbyte = {7'd0, olen[16]};
 		default: hbyte = 0;
 	endcase
@@ -191,7 +197,8 @@ always @(posedge clk) begin
 	end
 	else case(state)
 		S_IDLE:
-			if(trig) begin
+			if(trig | trig_dict) begin
+				dict <= trig_dict;
 				if(!file_ok) begin
 					info <= INFO_NOFILE; info_req <= 1;
 				end
@@ -207,7 +214,7 @@ always @(posedge clk) begin
 				r        <= cpu_reg;
 				halted_r <= halted;
 				mem_en   <= 1;
-				a        <= 17'h2000;
+				a        <= dict ? 17'h0000 : 17'h2000;
 				rc       <= 0;
 				oidx     <= 0;
 				osec     <= 0;
@@ -246,12 +253,20 @@ always @(posedge clk) begin
 		S_WAIT:
 			if(wt) wt <= wt - 1'd1;
 			else begin
-				b     <= (a < 17'h2400) ? page : mem_data;
+				b     <= (!dict && a < 17'h2400) ? page : mem_data;
 				state <= S_BYTE;
 			end
 
 		S_BYTE:
-			if(rc && b == rb && rc != 8'd240) begin
+			if(dict) begin
+				// dictionary dump: every byte as it is
+				q[0]     <= b;
+				qn       <= 1;
+				qi       <= 0;
+				emit_ret <= S_NEXT;
+				state    <= S_EMIT;
+			end
+			else if(rc && b == rb && rc != 8'd240) begin
 				rc    <= rc + 1'd1;
 				state <= S_NEXT;
 			end
@@ -271,7 +286,13 @@ always @(posedge clk) begin
 			end
 
 		S_NEXT:
-			if(a == 17'hFFFF) state <= S_FIN;
+			if(a == 17'hFFFF) begin
+				if(dict) begin
+					mem_en <= 0;
+					state  <= S_LAST;
+				end
+				else state <= S_FIN;
+			end
 			else begin
 				a     <= a + 1'd1;
 				state <= S_FETCH;
