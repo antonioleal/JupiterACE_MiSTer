@@ -1,20 +1,20 @@
 ## Jupiter Ace for MiSTer FPGA
 
 ### Features
-- RAM 51KB
+- Memory 3K, 19K, 35K, 51K (default) or 99K with Edwin Blink's 96K RAM pack
 - CPU speed Normal, x2 and x4
 - Scandoubler with HQ2x
 - Loads and saves `.ace` snapshots (SNAP001.ace, SNAP002.ace, ...)
-- Loads `.tap` and `.tzx` tapes (up to 128KB), with optional autoplay,
+- Loads `.tap` and `.tzx` tapes (up to 128KB), with optional auto play,
   auto rewind and 8x fast load
 - Saves to tape with `SAVE` / `BSAVE`: onto the inserted tape (replacing a
   program with the same name, with backups of the old version), or onto a new
   `.tap` or `.tzx` tape named after the program; optional 8x fast save
-- Spools Forth source files (`.fth`, `.fs`, `.f`) into the Ace, typed 8x
+- Spools Forth source files (`.fth`) into the Ace, typed 8x
   faster than by hand
 - Saves the dictionary as a Forth source file (DICT001.fth, ...) that spools
   back
-- Deletes `.tap`, `.tzx` and `.ace` files from the OSD (recoverable for 30 days)
+- Deletes `.tap`, `.tzx`, `.ace` and `.fth` files from the OSD (recoverable for 30 days)
 
 ### Install
 1. Copy `JupiterACE.rbf` to the root of the SD card (or to `_Computer/`).
@@ -28,7 +28,7 @@ script, installed once:
 3. Copy `scripts/JupiterACE.sh` to `/media/fat/Scripts/`.
 4. On the MiSTer, open the OSD **Scripts** menu and run `JupiterACE`.
    It:
-   - creates `games/JupiterACE/boot1.vhd` (257.5 KB, fixed size), the file
+   - creates `games/JupiterACE/boot1.vhd` (339.5 KB, fixed size), the file
      the core writes snapshots, tape saves and delete requests into;
    - adds itself to `/media/fat/linux/user-startup.sh`, so it starts at
      every boot;
@@ -45,23 +45,72 @@ when the script starts, as long as nothing else is saved in between.
 To update the script, copy the new version over the old one and run
 `JupiterACE` from the OSD **Scripts** menu again (or reboot the MiSTer).
 
-To remove the script, run `bash /media/fat/Scripts/JupiterACE.sh stop`, delete
-its line from `/media/fat/linux/user-startup.sh`, then delete the script and
-`games/JupiterACE/boot1.vhd`.
+**Uninstalling.** When installed, the script adds this line to
+`/media/fat/linux/user-startup.sh`, which starts its watcher at every boot:
+
+    [ -f "/media/fat/Scripts/JupiterACE.sh" ] && bash "/media/fat/Scripts/JupiterACE.sh" start
+
+When you remove the core, remove the script too:
+
+1. Stop the watcher: `bash /media/fat/Scripts/JupiterACE.sh stop`
+2. Delete that line from `/media/fat/linux/user-startup.sh` (with a text editor,
+   or `sed -i '/JupiterACE\.sh/d' /media/fat/linux/user-startup.sh`).
+3. Delete `/media/fat/Scripts/JupiterACE.sh` and `games/JupiterACE/boot1.vhd`.
+
+The line does nothing once the script is gone (it checks that the file is
+there), but it is best removed so `user-startup.sh` stays clean.
 
 The script's log is `/tmp/jupiterace_saved.log`. It is cleared at every
 reboot.
 
 ### Saving your OSD settings
+The tape and display options (Tape Auto Play, Tape Auto Rewind, Tape Sound,
+Tape Fast Load, Tape Fast Save, New Tape Format, Aspect ratio, Scandoubler Fx,
+Scale, CPU Speed and Memory) are in OSD → **Options**.
+
 OSD options are kept only once you save them: set them, press **Right** on
 the OSD to go to its second page, and choose **Save settings**. They are
 stored in `/media/fat/config/JupiterACE.CFG` and loaded every time the core
 starts. **Reset settings** on the same page goes back to the defaults.
 
+### Memory
+OSD → **Options** → **Memory** chooses how much RAM the Ace has:
+
+| Memory | RAM pack | RAM ends at (RAMTOP) |
+|---|---|---|
+| 3K | none: the Ace's own 1K video, 1K character set and 1K program RAM | `4000` |
+| 19K | 16K | `8000` |
+| 35K | 32K | `C000` |
+| 51K (default) | 48K | `0000` (top of memory) |
+| 99K | 96K: two 48K pages | `0000` (top of memory) |
+
+Changing it restarts the Ace. Missing RAM ignores writes and reads `FF`, so the
+ROM's RAM test at power-on finds the size, as on the real machine.
+
+**The 96K RAM pack** is Edwin Blink's design
+([jupiter-ace.co.uk](https://jupiter-ace.co.uk/hardware_96kram_pack.html)), as
+in [xAce-baremetal](https://github.com/antonioleal/xAce-baremetal): two 48K
+pages, both at `4000-FFFF`; the Ace's own 3K is never paged. It starts on page
+0 and works as a 48K pack (the ROM finds 51K). Bit 7 of the Z80's R register
+selects the page: the pack latches it in every refresh cycle, and only `LD R,A`
+changes it, so `LD A,128 : LD R,A` gives page 1 and `XOR A : LD R,A` page 0.
+The new page takes over at the refresh after the next opcode fetch (that opcode
+still comes from the old page) or at an interrupt, so code that switches pages
+should run below `4000`. A reset goes back to page 0.
+
+**Snapshots and memory:** a snapshot records the memory size at `2080` and
+holds memory up to RAMTOP, as other emulators expect. With the 96K pack the
+page in use is saved as usual and the other page follows the end marker
+(`XACE96K`, as xAce does); other emulators stop at the end marker and load it
+as a 51K snapshot. Loading a snapshot that needs more memory than is set (by
+its RAMTOP, its size, or a 96K page) enlarges the memory for it: the OSD shows
+"Memory raised for snapshot", and **Memory** in the OSD keeps your setting
+until you change it.
+
 ### Tapes
 1. OSD → **Insert Tape** and pick a `.tap` or `.tzx` file. The tape is rewound.
 2. Type `LOAD name` (dictionary) or `0 0 BLOAD name` (bytes) on the Ace.
-3. Start the tape with **Tape Play/Pause**, or turn on **Tape Autoplay**
+3. Start the tape with **Tape Play/Pause**, or turn on **Tape Auto Play**
    (off by default): the tape then plays by itself while the ROM is loading
    and pauses when it stops. **Tape Rewind** goes back to the start.
 
@@ -149,7 +198,7 @@ reusing the same space every time, so the file never grows; the script copies
 each new snapshot out as the next SNAPnnn.ace.
 
 ### Spooling Forth source
-OSD → **Spool Forth File** and pick a `.fth`, `.fs` or `.f` file: it is typed
+OSD → **Spool Forth File** and pick a `.fth` file: it is typed
 into the Ace line by line, as if from the keyboard, and each line is run or
 compiled before the next one. The Ace runs 8 times faster while spooling, so
 it takes about 12 seconds per 1000 characters. Close the OSD to watch it.
@@ -188,13 +237,15 @@ into `games/JupiterACE/boot1.vhd`; the script turns the words into Forth
 source. The Ace itself is not changed.
 
 ### Deleting files
-OSD → **Delete File** opens a file browser for `.tap`, `.tzx` and `.ace` files.
-The file you pick is moved to `games/JupiterACE/backup/deleted/` (same
-subfolder; a timestamp is added if a file with that name is already there), so
-a wrong pick can be undone by moving it back within 30 days; after that it is
-erased. The OSD shows "File deleted" once you close the OSD.
+OSD → **Delete \*.TAP,TZX,ACE,FTH** opens a file browser for `.tap`, `.tzx`,
+`.ace` and `.fth` files.
+The file you pick is moved to `games/JupiterACE/deleted/` (same subfolder; a
+timestamp is added if a file with that name is already there), so a wrong pick
+can be undone by moving it back within 30 days; after that it is erased.
+Picking a file that is already in `deleted/` erases it for good. The OSD shows
+"File deleted" once you close the OSD.
 Deleting the inserted tape also ejects it. There is no confirmation step:
-picking the file deletes it. Files already in `backup/` are never deleted.
+picking the file deletes it. Files in `backup/` are never deleted.
 
 ### OSD messages
 Messages appear while the OSD is closed.
@@ -211,7 +262,9 @@ Messages appear while the OSD is closed.
 | Snapshot: run JupiterACE.sh | `boot1.vhd` is missing: install the script, then load the core again (also for **Save Dictionary**). |
 | Snapshot failed: CPU busy | The Ace could not be stopped (for example, during a reset). Try again. |
 | Snapshot failed: see log | The script could not write the snapshot file. |
-| File deleted | The file was moved to `backup/deleted/`. |
+| Snapshot failed: too big | A 99K snapshot did not fit in `boot1.vhd` (only with memory that packs badly). |
+| Memory raised for snapshot | The snapshot needed more memory than set; it was enlarged for it. |
+| File deleted | The file was moved to `deleted/`, or erased if it was already there. |
 | Delete failed: see log | The script could not find or move the file. |
 | Delete: run JupiterACE.sh | `boot1.vhd` is missing: install the script, then load the core again. |
 | Spool done | The whole file was typed. |

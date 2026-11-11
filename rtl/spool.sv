@@ -1,7 +1,7 @@
 //============================================================================
 //  Jupiter Ace: spool a Forth source file
 //
-//  OSD "Spool Forth File" (SD slot 3) picks a .fth/.fs/.f file; this module
+//  OSD "Spool Forth File" (SD slot 3) picks a .fth file; this module
 //  types it into the Ace through the keyboard matrix, line by line, like
 //  xAce's spooling. The core runs 8x faster while spooling, with the frame
 //  interrupt counted in CPU time, so the ROM sees normal key timing.

@@ -1,13 +1,14 @@
 //============================================================================
-//  Jupiter Ace OSD "Delete File"
+//  Jupiter Ace OSD "Delete"
 //
-//  The OSD has no way to delete files, so "Delete File" is a file browser
+//  The OSD has no way to delete files, so "Delete" is a file browser
 //  slot (SD slot 2): picking a file makes Main_MiSTer open it for the core.
 //  This module reads the whole file to get its POSIX cksum CRC, then writes a
-//  delete request into sector 514 of games/JupiterACE/boot1.vhd (SD slot 1).
+//  delete request into sector 678 of games/JupiterACE/boot1.vhd (SD slot 1).
 //  JupiterACE.sh finds the open file with that checksum, moves it to
-//  games/JupiterACE/backup/deleted/ and writes the answer into the same
-//  sector, which this module polls and reports on the OSD.
+//  games/JupiterACE/deleted/ (or erases it if it is already there) and writes
+//  the answer into the same sector, which this module polls and reports on
+//  the OSD.
 //
 //  Request sector layout:
 //      0  "JACEDEL1"
@@ -17,7 +18,7 @@
 //      20 file length (LE32)
 //
 //  Main_MiSTer caches 32 sectors of reads per disk, so every poll first reads
-//  sector 0 and then sector 514: each read then comes from the file.
+//  sector 0 and then sector 678: each read then comes from the file.
 //
 //  This program is free software; you can redistribute it and/or modify it
 //  under the terms of the GNU General Public License as published by the Free
@@ -66,8 +67,8 @@ localparam INFO_KEPT     = 8'd10;
 localparam INFO_NOSCRIPT = 8'd11;
 localparam INFO_NOFILE   = 8'd12;
 
-localparam REQ_LBA   = 32'd514;
-localparam FILE_SIZE = 64'd263680; // 515 sectors
+localparam REQ_LBA   = 32'd678;
+localparam FILE_SIZE = 64'd347648; // 679 sectors
 
 // boot1.vhd is big enough for the request sector
 reg file_ok = 0;

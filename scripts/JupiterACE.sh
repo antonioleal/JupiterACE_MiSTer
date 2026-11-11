@@ -25,8 +25,8 @@
 #
 #  The core cannot create files, so this script creates a fixed-size file,
 #  games/JupiterACE/boot1.vhd, that Main_MiSTer mounts when the core starts,
-#  and watches it. The core writes snapshots into its first half and tape
-#  saves into its second half.
+#  and watches it. The core writes snapshots (and dictionary dumps) into
+#  sectors 0-420, tape saves into 421-677 and delete requests into 678.
 #
 #  Tapes: when the Ace SAVEs onto the inserted tape, this script merges each
 #  saved program into the inserted tape file (games/JupiterACE/..., any
@@ -44,10 +44,10 @@
 #  user's words are written as Forth source to games/JupiterACE/DICTnnn.fth
 #  (listed as the ROM's LIST would), ready to be spooled back.
 #
-#  Delete File: the file picked in the OSD is moved to
-#  games/JupiterACE/backup/deleted/ (same subfolder) and erased from there
-#  after DELETED_DAYS (30) days; the answer goes back to the core, which
-#  shows it on the OSD.
+#  Delete: the file picked in the OSD is moved to
+#  games/JupiterACE/deleted/ (same subfolder) and erased from there
+#  after DELETED_DAYS (30) days; a file picked in deleted/ is erased for
+#  good. The answer goes back to the core, which shows it on the OSD.
 #
 #  Usage (bash + BusyBox only):
 #    JupiterACE.sh            install into user-startup.sh and start
@@ -62,12 +62,13 @@
 FAT=${JA_FAT:-/media/fat}
 GAMES=$FAT/games/JupiterACE
 PREV=$GAMES/backup
+DEL=$GAMES/deleted         # where Delete puts files
 KEEP_BACKUPS=3             # backups kept per tape in backup/
-DELETED_DAYS=30            # days a file stays in backup/deleted/
-VHD=$GAMES/boot1.vhd       # written by the core (SD slot 1): sectors 0-256 snapshots,
-VHD_SECTORS=515            #   257-513 tape saves, 514 delete requests
-SAV_OFF=$((257 * 512))     # start of the tape save area
-DEL_OFF=$((514 * 512))     # delete request sector
+DELETED_DAYS=30            # days a file stays in deleted/
+VHD=$GAMES/boot1.vhd       # written by the core (SD slot 1): sectors 0-420 snapshots,
+VHD_SECTORS=679            #   421-677 tape saves, 678 delete requests
+SAV_OFF=$((421 * 512))     # start of the tape save area
+DEL_OFF=$((678 * 512))     # delete request sector
 STARTUP=$FAT/linux/user-startup.sh
 SELF=$(readlink -f "$0")
 RUN=${JA_RUN:-/tmp}
@@ -188,7 +189,7 @@ find_tape() {
 		for f in /proc/"$pid"/fd/*; do
 			f=$(readlink "$f")
 			case $f in
-				"$PREV"/*) ;;
+				"$PREV"/*|"$DEL"/*) ;;
 				*.[tT][aA][pP]|*.[tT][zZ][xX]) [ -f "$f" ] && is_tape "$1" "$2" "$f" && { echo "$f"; return 0; } ;;
 			esac
 		done
@@ -196,7 +197,7 @@ find_tape() {
 	# otherwise any tape in games/JupiterACE with the same contents
 	while IFS= read -r f; do
 		is_tape "$1" "$2" "$f" && { echo "$f"; return 0; }
-	done < <(find "$GAMES" -path "$PREV" -prune -o -type f \( -iname '*.tap' -o -iname '*.tzx' \) -print)
+	done < <(find "$GAMES" \( -path "$PREV" -o -path "$DEL" \) -prune -o -type f \( -iname '*.tap' -o -iname '*.tzx' \) -print)
 	return 1
 }
 
@@ -306,12 +307,10 @@ process() {
 	esac
 }
 
-# make_vhd: create boot1.vhd, or bring it to its full size (0 = changed now)
+# make_vhd: create boot1.vhd if it is not there (0 = created now)
 make_vhd() {
-	local have=0
-	[ -f "$VHD" ] && have=$(( $(fsize "$VHD") / 512 ))
-	[ "$have" -ge "$VHD_SECTORS" ] && return 1
-	mkdir -p "$GAMES" && dd if=/dev/zero of="$VHD" bs=512 seek="$have" count=$((VHD_SECTORS - have)) conv=notrunc 2>/dev/null
+	[ -f "$VHD" ] && return 1
+	mkdir -p "$GAMES" && dd if=/dev/zero of="$VHD" bs=512 count="$VHD_SECTORS" 2>/dev/null
 	log "made $VHD $((VHD_SECTORS * 512)) bytes"
 	return 0
 }
@@ -327,23 +326,24 @@ prune_backups() {
 	while IFS= read -r f; do rm -f "$f" && log "removed old backup ${f#"$GAMES"/}"; done
 }
 
-# purge_deleted: empty backup/deleted/ of files deleted more than $DELETED_DAYS days ago
+# purge_deleted: empty deleted/ of files deleted more than $DELETED_DAYS days ago
 purge_deleted() {
 	local f
-	[ -d "$PREV/deleted" ] || return 0
-	find "$PREV/deleted" -type f -mtime +"$DELETED_DAYS" | while IFS= read -r f; do
+	[ -d "$DEL" ] || return 0
+	find "$DEL" -type f -mtime +"$DELETED_DAYS" | while IFS= read -r f; do
 		rm -f "$f" && log "removed ${f#"$GAMES"/} (deleted over $DELETED_DAYS days ago)"
 	done
-	find "$PREV/deleted" -depth -type d | while IFS= read -r f; do
-		[ "$f" = "$PREV/deleted" ] || rmdir "$f" 2>/dev/null   # only empty folders go
+	find "$DEL" -depth -type d | while IFS= read -r f; do
+		[ "$f" = "$DEL" ] || rmdir "$f" 2>/dev/null   # only empty folders go
 	done
 }
 
-# ---- Delete File ----
+# ---- Delete ----
 # answer N: tell the core how the delete request went (3 = deleted, 4 = not)
 answer() { done_mark "$DEL_OFF" "$1"; }
 
-# delete_req: move the file picked in the OSD "Delete File" to backup/deleted/
+# delete_req: move the file picked in the OSD "Delete" to deleted/, or erase it
+# for good if it is already in deleted/
 delete_req() {
 	local h=$WORK/del_hdr crc len f pid target rel dest base ext ts
 	[ -f "$VHD" ] && [ "$(fsize "$VHD")" -ge $((DEL_OFF + 512)) ] || return 0
@@ -360,19 +360,32 @@ delete_req() {
 			f=$(readlink "$f")
 			case $f in
 				"$PREV"/*) ;;
-				*.[tT][aA][pP]|*.[tT][zZ][xX]|*.[aA][cC][eE])
+				*.[tT][aA][pP]|*.[tT][zZ][xX]|*.[aA][cC][eE]|*.[fF][tT][hH])
 					[ -f "$f" ] && is_tape "$crc" "$len" "$f" && { target=$f; break 2; } ;;
 			esac
 		done
 	done
 	if [ -z "$target" ]; then
-		log "Delete File: the picked file was not found (only .tap/.tzx/.ace outside backup/ are deleted)"
+		log "Delete: the picked file was not found (only .tap/.tzx/.ace/.fth outside backup/ are deleted)"
 		answer 4; return 0
 	fi
 
+	# already in deleted/: erase it for good
 	case $target in
-		"$GAMES"/*) rel=${target#"$GAMES"/}; dest=$PREV/deleted/$rel ;;
-		*)          rel=$target; dest=$(dirname "$target")/backup/deleted/$(basename "$target") ;;
+		"$DEL"/*)
+			if rm -f "$target"; then
+				log "Delete: erased ${target#"$GAMES"/} for good"
+				answer 3
+			else
+				log "Delete: cannot erase ${target#"$GAMES"/}"
+				answer 4
+			fi
+			return 0 ;;
+	esac
+
+	case $target in
+		"$GAMES"/*) rel=${target#"$GAMES"/}; dest=$DEL/$rel ;;
+		*)          rel=$target; dest=$(dirname "$target")/deleted/$(basename "$target") ;;
 	esac
 	if [ -e "$dest" ]; then
 		ts=$(date +%Y%m%d_%H%M%S); base=${dest%.*}; ext=${dest##*.}
@@ -380,10 +393,10 @@ delete_req() {
 	fi
 	if mkdir -p "$(dirname "$dest")" && mv "$target" "$dest"; then
 		touch "$dest"   # the 30 days count from the deletion, not from the file's own date
-		log "Delete File: moved $rel to ${dest#"$GAMES"/}"
+		log "Delete: moved $rel to ${dest#"$GAMES"/}"
 		answer 3
 	else
-		log "Delete File: cannot move $rel"
+		log "Delete: cannot move $rel"
 		answer 4
 	fi
 }
@@ -604,7 +617,7 @@ next_name() {
 		case $n in ''|*[!0-9]*) continue ;; esac
 		n=$((10#$n))
 		[ "$n" -gt "$max" ] && max=$n
-	done < <(find "$GAMES" -path "$PREV" -prune -o -type f -iname "$p*.$e" -print)
+	done < <(find "$GAMES" \( -path "$PREV" -o -path "$DEL" \) -prune -o -type f -iname "$p*.$e" -print)
 	printf '%s/%s%03d.%s' "$GAMES" "$p" $((max + 1)) "$e"
 }
 
@@ -667,7 +680,7 @@ daemon() {
 			m=$(stat -c '%Y %s' "$VHD")
 			[ "$vm" != "$m" ] && { snap; process; delete_req; vm=$(stat -c '%Y %s' "$VHD"); }
 		fi
-		# once a day (and at start): empty old files out of backup/deleted/
+		# once a day (and at start): empty old files out of deleted/
 		[ "$day" != "$(date +%Y%m%d)" ] && { purge_deleted; day=$(date +%Y%m%d); }
 		sleep 2
 	done

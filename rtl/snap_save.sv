@@ -44,6 +44,9 @@ module snap_save
 	output reg        hold,         // stop the CPU at the next instruction boundary
 	input             held,
 	input             halted,
+	input       [2:0] mem_rank,     // 0 = 3K, 1 = 19K, 2 = 35K, 3 = 51K, 4 = 99K (96K pack)
+	input             pack_page,    // the 96K pack's page in use
+	output reg        other = 0,    // reading the 96K pack's other page
 	input     [211:0] cpu_reg,      // IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
 	output reg        mem_en,
 	output reg [15:0] mem_addr,
@@ -70,8 +73,11 @@ module snap_save
 localparam INFO_SAVED  = 8'd6;
 localparam INFO_NOFILE = 8'd7;
 localparam INFO_BUSY   = 8'd8;
+localparam INFO_TOOBIG = 8'd22;
 
-localparam FILE_SECTORS = 257;  // header + 128 KB, more than the worst case packing
+localparam FILE_SECTORS = 679;  // all of boot1.vhd (snapshot area: header + 420 sectors,
+                                // more than the worst case packing of a 99K snapshot)
+localparam DATA_SECTORS = 420;
 
 // the snapshot file is usable
 reg file_ok = 0;
@@ -85,13 +91,28 @@ reg [211:0] r;
 reg         halted_r;
 wire [15:0] pc = r[79:64] - (halted_r ? 16'd1 : 16'd0);  // resume inside HALT
 
+// end of the RAM, as at 2080h, and the last address saved
+wire [7:0]  rt_hi = (mem_rank == 3'd0) ? 8'h40 : (mem_rank == 3'd1) ? 8'h80 : (mem_rank == 3'd2) ? 8'hC0 : 8'h00;
+wire [16:0] end_a = (dict || other) ? 17'hFFFF : {1'b0, rt_hi - 1'd1, 8'hFF};
+reg         page_r;      // page in use when stopped
+reg  [3:0]  si;
+
+// after the image of a 96K pack's page in use: "XACE96K" 01 <page>, then its other page
+function [7:0] sig96(input [3:0] i, input p);
+	case(i)
+		0: sig96 = "X"; 1: sig96 = "A"; 2: sig96 = "C"; 3: sig96 = "E";
+		4: sig96 = "9"; 5: sig96 = "6"; 6: sig96 = "K"; 7: sig96 = 8'h01;
+		default: sig96 = {7'd0, p};
+	endcase
+endfunction
+
 // the byte of the 2000-23FF page at the source address
 reg [16:0] a;          // source address
 reg  [7:0] page;
 always @(*) begin
 	case(a[9:0])
 		'h000: page = 8'h01;      'h001: page = 8'h80;
-		'h082: page = 8'h01;                                // RAM top 10000h
+		'h081: page = rt_hi;                                // end of RAM (LE32), 0 for 64K
 		'h08C: page = 8'h03;      'h090: page = 8'h03;
 		'h094: page = 8'hFD;      'h095: page = 8'hFD;
 		'h100: page = r[15:8];    'h101: page = r[7:0];     // F, A
@@ -156,6 +177,8 @@ localparam S_FIN   = 4'd8;
 localparam S_LAST  = 4'd9;
 localparam S_HDR2  = 4'd10;
 localparam S_DONE  = 4'd11;
+localparam S_AFTER = 4'd12;  // after an end marker: the 96K pack's other page, or done
+localparam S_SIG   = 4'd13;
 
 reg  [3:0] state = S_IDLE;
 reg  [3:0] ret, emit_ret;
@@ -213,6 +236,8 @@ always @(posedge clk) begin
 			if(held && !sd_hold) begin
 				r        <= cpu_reg;
 				halted_r <= halted;
+				page_r   <= pack_page;
+				other    <= 0;
 				mem_en   <= 1;
 				a        <= dict ? 17'h0000 : 17'h2000;
 				rc       <= 0;
@@ -286,7 +311,7 @@ always @(posedge clk) begin
 			end
 
 		S_NEXT:
-			if(a == 17'hFFFF) begin
+			if(a == end_a) begin
 				if(dict) begin
 					mem_en <= 0;
 					state  <= S_LAST;
@@ -305,7 +330,15 @@ always @(posedge clk) begin
 				qi         <= qi + 1'd1;
 				oidx       <= oidx + 1'd1;
 				olen       <= olen + 1'd1;
-				if(oidx == 9'd511) begin
+				if(oidx == 9'd511 && osec == DATA_SECTORS) begin
+					// the snapshot area is full: give up
+					mem_en <= 0;
+					other  <= 0;
+					hold   <= 0;
+					info   <= INFO_TOOBIG; info_req <= 1;
+					state  <= S_IDLE;
+				end
+				else if(oidx == 9'd511) begin
 					// sector full
 					sd_lba   <= osec + 1'd1;
 					osec     <= osec + 1'd1;
@@ -323,9 +356,35 @@ always @(posedge clk) begin
 				q[cnt + 1'd1] <= 8'h00;
 				qn            <= cnt + 3'd2;
 				qi            <= 0;
-				mem_en        <= 0;
-				emit_ret      <= S_LAST;
+				emit_ret      <= S_AFTER;
 				state         <= S_EMIT;
+			end
+
+		S_AFTER:
+			if(mem_rank == 3'd4 && !other) begin
+				si    <= 0;
+				state <= S_SIG;
+			end
+			else begin
+				mem_en <= 0;
+				other  <= 0;
+				state  <= S_LAST;
+			end
+
+		S_SIG:
+			if(si == 4'd9) begin
+				other <= 1;
+				a     <= 17'h4000;
+				rc    <= 0;
+				state <= S_FETCH;
+			end
+			else begin
+				q[0]     <= sig96(si, page_r);
+				qn       <= 1;
+				qi       <= 0;
+				si       <= si + 1'd1;
+				emit_ret <= S_SIG;
+				state    <= S_EMIT;
 			end
 
 		S_LAST:

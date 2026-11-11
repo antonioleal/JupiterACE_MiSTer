@@ -64,26 +64,30 @@ parameter CONF_STR = {
 	"TG,Eject Tape;",
 	"TC,Tape Play/Pause;",
 	"TD,Tape Rewind;",
-	"O6,Tape Autoplay,Off,On;",
-	"OJ,Tape Auto Rewind,Off,On;",
-	"O7,Tape Sound,On,Off;",
-	"OF,Tape Fast Load,Off,On;",
-	"OH,Tape Fast Save,Off,On;",
-	"OI,New Tape Format,TAP,TZX;",
 	"-;",
-	"S3,FTHFS F,Spool Forth File;",
+	"S3,FTH,Spool Forth File;",
 	"TK,Stop Spool;",
 	"-;",
-	"S2,TAPTZXACE,Delete File;",
+	"S2,TAPTZXACEFTH,Delete;",
 	"-;",
-	"O89,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
-	"O23,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%;",
-	"OAB,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
+	"P1,Options;",
+	"P1O6,Tape Auto Play,Off,On;",
+	"P1OJ,Tape Auto Rewind,Off,On;",
+	"P1O7,Tape Sound,On,Off;",
+	"P1OF,Tape Fast Load,Off,On;",
+	"P1OH,Tape Fast Save,Off,On;",
+	"P1OI,New Tape Format,TAP,TZX;",
+	"P1-;",
+	"P1O89,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
+	"P1O23,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%;",
+	"P1OAB,Scale,Normal,V-Integer,Narrower HV-Integer,Wider HV-Integer;",
+	"P1-;",
+	"P1O45,CPU Speed,Normal,x2,x4;",
+	"P1OMO,Memory,51K,35K,19K,3K,99K;",
 	"-;",
-	"O45,CPU Speed,Normal,x2,x4;",
 	"R0,Reset;",
 	"J,Fire;",
-	"I,Tape saved,New tape created,Tape full: save discarded,Save failed: bad block,Save failed: run JupiterACE.sh,Snapshot saved,Snapshot: run JupiterACE.sh,Snapshot failed: CPU busy,File deleted,Delete failed: see log,JupiterACE.sh not running,Delete: run JupiterACE.sh,Tape save failed: see log,Snapshot failed: see log,Spool done,Spool done with errors,Spool stopped: line not OK,Spool stopped,Dictionary saved,Dictionary failed: see log;",
+	"I,Tape saved,New tape created,Tape full: save discarded,Save failed: bad block,Save failed: run JupiterACE.sh,Snapshot saved,Snapshot: run JupiterACE.sh,Snapshot failed: CPU busy,File deleted,Delete failed: see log,JupiterACE.sh not running,Delete: run JupiterACE.sh,Tape save failed: see log,Snapshot failed: see log,Spool done,Spool done with errors,Spool stopped: line not OK,Spool stopped,Dictionary saved,Dictionary failed: see log,Memory raised for snapshot,Snapshot failed: too big;",
 	"V,v",`BUILD_DATE
 };
 
@@ -164,15 +168,15 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(4)) hps_io
 	.sd_buff_din('{8'h00, f_din, 8'h00, 8'h00}),
 	.sd_buff_wr(sd_buff_wr),
 
-	.info_req(tape_msg | snap_msg | del_info_req | poll_info_req | sp_info_req | new_start),
-	.info(new_start ? 8'd2 : tape_msg ? tape_info : snap_msg ? snap_info : del_info_req ? del_info : poll_info_req ? poll_info : sp_info)
+	.info_req(tape_msg | snap_msg | del_info_req | poll_info_req | sp_info_req | new_start | mem_raised),
+	.info(new_start ? 8'd2 : mem_raised ? 8'd21 : tape_msg ? tape_info : snap_msg ? snap_info : del_info_req ? del_info : poll_info_req ? poll_info : sp_info)
 );
 
 // SD slot 0: tape image (S0 option)
 // SD slot 1: games/JupiterACE/boot1.vhd, mounted when the core starts:
-//            sectors 0-256 snapshots, 257-513 tape saves, 514 delete
+//            sectors 0-420 snapshots, 421-677 tape saves, 678 delete
 //            requests. Only one of the three writers uses it at a time.
-// SD slot 2: the file picked in "Delete File" (S2 option)
+// SD slot 2: the file picked in "Delete" (S2 option)
 // SD slot 3: the file picked in "Spool Forth File" (S3 option)
 wire  [3:0] img_mounted;
 wire        img_readonly;
@@ -182,7 +186,7 @@ wire        sd_wr, sd_ack, snap_wr, snap_ack;
 wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_din, snap_buff_din, sd_buff_dout;
 wire        sd_buff_wr;
-wire [31:0] f_lba  = snap_busy ? snap_lba : del_busy ? del_lba1 : poll_busy ? poll_lba : sd_lba + 32'd257;
+wire [31:0] f_lba  = snap_busy ? snap_lba : del_busy ? del_lba1 : poll_busy ? poll_lba : sd_lba + 32'd421;
 wire        f_wr   = snap_wr | sd_wr | del_wr1;
 wire        f_rd   = del_rd1 | poll_rd;
 wire  [7:0] f_din  = snap_busy ? snap_buff_din : del_busy ? del_din1 : sd_buff_din;
@@ -198,6 +202,30 @@ reg        loader_wr;
 reg        loader_en;
 reg        loader_reset = 0;
 
+// The .ACE loader. After the image's end marker (ED 00) a snapshot of a 96K RAM
+// pack (xAce's extension) carries the other page:
+//   "XACE96K" 01 <page in use>, then 4000-FFFF of the other page, packed the same way, ED 00
+// The image goes into physical page 0 and that block into physical page 1; when
+// loading ends the page in use is set to map onto physical page 0 (see ace.sv).
+// The memory is enlarged if the snapshot needs more than is set (its RAMTOP, or
+// data above the current memory, or the 96K block).
+reg  [1:0] ld_blk;          // 0 the image, 1 the block header, 2 the other page, 3 done
+reg  [3:0] ld_sig;
+reg        ld_blk_seen, ld_blk_page, ld_r7;
+reg  [7:0] ld_rt_lo;
+reg  [2:0] ld_need;          // memory the snapshot needs (rank, see MEMORY)
+reg        ld_need_set;      // pulse
+reg        pg_set;           // pulse: loading ended, set the 96K page
+reg        pg_set_page;
+wire       ld_phys = (ld_blk == 2'd2);
+
+function [7:0] sig96(input [3:0] i);
+	case(i)
+		0: sig96 = "X"; 1: sig96 = "A"; 2: sig96 = "C"; 3: sig96 = "E";
+		4: sig96 = "9"; 5: sig96 = "6"; 6: sig96 = "K"; default: sig96 = 8'h01;
+	endcase
+endfunction
+
 always @(posedge clk_sys) begin
 	reg [7:0] cnt = 0;
 	reg [1:0] status = 0;
@@ -205,7 +233,9 @@ always @(posedge clk_sys) begin
 	integer   timeout = 0;
 
 	old_download <= ioctl_download;
-	
+	ld_need_set  <= 0;
+	pg_set       <= 0;
+
 	loader_reset <= 0;
 	if(~old_download && ioctl_download && ioctl_index[5:0] == 1) begin
 		loader_addr <= 'h2000;
@@ -214,14 +244,48 @@ always @(posedge clk_sys) begin
 		ioctl_wait <= 1;
 		timeout <= 3000000;
 		cnt <= 0;
+		ld_blk      <= 0;
+		ld_sig      <= 0;
+		ld_blk_seen <= 0;
+		ld_r7       <= 0;
 	end
-	
+
 	loader_wr <= 0;
-	if(loader_wr) loader_addr <= loader_addr + 1'd1;
+	if(loader_wr) begin
+		loader_addr <= loader_addr + 1'd1;
+		// what the snapshot needs: bit 7 of R, RAMTOP, and memory above the current size
+		if(loader_addr == 16'h2140) ld_r7 <= loader_data[7];
+		if(loader_addr == 16'h3C18) ld_rt_lo <= loader_data;
+		if(loader_addr == 16'h3C19) begin
+			ld_need_set <= 1;
+			ld_need     <= (loader_data == 8'h00) ? 3'd3 : (loader_data <= 8'h40) ? 3'd0 :
+			               (loader_data <= 8'h80) ? 3'd1 : (loader_data <= 8'hC0) ? 3'd2 : 3'd3;
+		end
+		if(ld_phys) begin ld_need_set <= 1; ld_need <= 3'd4; end
+		else if(loader_addr[15:14] != 2'b00) begin
+			ld_need_set <= 1;
+			ld_need     <= {1'b0, loader_addr[15:14]};   // 4000: 19K, 8000: 35K, C000: 51K
+		end
+	end
 
 	if(ioctl_wr && ioctl_index[5:0] == 1) begin
 		loader_en <= 1;
-		case(status)
+		if(ld_blk == 2'd1) begin
+			// "XACE96K" 01 <page>
+			if(ld_sig == 4'd8) begin
+				if(ioctl_dout[7:1]) ld_blk <= 3;
+				else begin
+					ld_blk_page <= ioctl_dout[0];
+					ld_blk_seen <= 1;
+					ld_blk      <= 2;
+					loader_addr <= 16'h4000;
+					status      <= 0;
+				end
+			end
+			else if(ioctl_dout != sig96(ld_sig)) ld_blk <= 3;
+			else ld_sig <= ld_sig + 1'd1;
+		end
+		else if(ld_blk != 2'd3) case(status)
 			0: if(ioctl_dout == 'hED) status <= 1;
 				else begin
 					loader_wr <= 1;
@@ -229,7 +293,11 @@ always @(posedge clk_sys) begin
 				end
 			1: begin
 					cnt <= ioctl_dout;
-					status <= ioctl_dout ? 2'd2 : 2'd3; // cnt = 0 => stop
+					if(ioctl_dout) status <= 2'd2;
+					else begin                          // ED 00: end of the image (or of the 96K block)
+						status <= 2'd0;
+						ld_blk <= (ld_blk == 2'd0) ? 2'd1 : 2'd3;
+					end
 				end
 			2: begin
 					loader_data <= ioctl_dout;
@@ -247,8 +315,45 @@ always @(posedge clk_sys) begin
 		else {status,ioctl_wait} <= 0;
 	end
 
-	if(old_download & ~ioctl_download) loader_en <= 0;
+	if(old_download & ~ioctl_download) begin
+		loader_en   <= 0;
+		pg_set      <= 1;
+		pg_set_page <= ld_blk_seen ? ld_blk_page : ld_r7;
+	end
 	if(reset) ioctl_wait <= 0;
+end
+
+/////////////////  MEMORY  ////////////////////////
+
+// Options -> Memory: 51K (default), 35K, 19K, 3K or 99K (Edwin Blink's 96K RAM
+// pack: two 48K pages at 4000-FFFF, see ace.sv). Ranks: 0 = 3K, 1 = 19K,
+// 2 = 35K, 3 = 51K, 4 = 99K. Changing the option restarts the Ace, so the ROM's
+// RAM test finds the new size. A snapshot that needs more memory enlarges it
+// until the option is changed again.
+wire [2:0] mem_opt  = status[24:22];
+wire [2:0] mem_want = (mem_opt == 3'd1) ? 3'd2 : (mem_opt == 3'd2) ? 3'd1 :
+                      (mem_opt == 3'd3) ? 3'd0 : (mem_opt == 3'd4) ? 3'd4 : 3'd3;
+reg  [2:0] mem_rank = 3'd3;
+reg  [3:0] mem_rst  = 0;     // reset after a change
+reg        mem_cold;         // pulse: the memory is new (96K page mapping cleared)
+reg        mem_raised;       // pulse: enlarged for a snapshot
+always @(posedge clk_sys) begin
+	reg [2:0] old_opt = 0;
+
+	mem_cold   <= 0;
+	mem_raised <= 0;
+	old_opt    <= mem_opt;
+	if(mem_rst) mem_rst <= mem_rst - 1'd1;
+
+	if(old_opt != mem_opt) begin
+		mem_rank <= mem_want;
+		mem_rst  <= '1;
+		mem_cold <= 1;
+	end
+	else if(ld_need_set && ld_need > mem_rank) begin
+		mem_rank   <= ld_need;
+		mem_raised <= 1;
+	end
 end
 
 /////////////////  SNAPSHOT SAVE  /////////////////
@@ -268,6 +373,7 @@ always @(posedge clk_sys) begin
 	old_snap_trig <= status[14];
 	old_dict_trig <= status[21];
 end
+wire snap_other, page;
 wire snap_ok_now = ~ioctl_download & ~tape_dl & ~save_busy & ~del_busy;
 wire snap_dict;
 
@@ -283,6 +389,9 @@ snap_save snap_save
 	.held(snap_held),
 	.halted(cpu_halted),
 	.cpu_reg(cpu_reg),
+	.mem_rank(mem_rank),
+	.pack_page(page),
+	.other(snap_other),
 	.mem_en(snap_en),
 	.mem_addr(snap_addr),
 	.mem_data(snap_data),
@@ -524,7 +633,7 @@ always @(posedge clk_sys) begin
 	tape_rewind <= (~old_rew & status[13]) | auto_rw | wrap_rw;
 end
 
-// Autoplay: run the tape while the ROM LOAD routine is executing
+// Auto Play: run the tape while the ROM LOAD routine is executing
 reg [16:0] load_timer = 0;
 always @(posedge clk_sys) begin
 	if(tape_load) load_timer <= '1;
@@ -674,7 +783,7 @@ tzx tzx
 
 ///////////////////////////////////////////////////
 
-wire reset = RESET | status[0] | buttons[1];
+wire reset = RESET | status[0] | buttons[1] | |mem_rst;
 
 wire mic,spk;
 
