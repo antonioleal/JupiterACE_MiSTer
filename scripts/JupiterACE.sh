@@ -26,7 +26,7 @@
 #  The core cannot create files, so this script creates a fixed-size file,
 #  games/JupiterACE/boot1.vhd, that Main_MiSTer mounts when the core starts,
 #  and watches it. The core writes snapshots (and dictionary dumps) into
-#  sectors 0-420, tape saves into 421-677 and delete requests into 678.
+#  sectors 0-760, tape saves into 761-1017 and delete requests into 1018.
 #
 #  Tapes: when the Ace SAVEs onto the inserted tape, this script merges each
 #  saved program into the inserted tape file (games/JupiterACE/..., any
@@ -65,10 +65,10 @@ PREV=$GAMES/backup
 DEL=$GAMES/deleted         # where Delete puts files
 KEEP_BACKUPS=3             # backups kept per tape in backup/
 DELETED_DAYS=30            # days a file stays in deleted/
-VHD=$GAMES/boot1.vhd       # written by the core (SD slot 1): sectors 0-420 snapshots,
-VHD_SECTORS=679            #   421-677 tape saves, 678 delete requests
-SAV_OFF=$((421 * 512))     # start of the tape save area
-DEL_OFF=$((678 * 512))     # delete request sector
+VHD=$GAMES/boot1.vhd       # written by the core (SD slot 1): sectors 0-760 snapshots,
+VHD_SECTORS=1019           #   761-1017 tape saves, 1018 delete requests
+SAV_OFF=$((761 * 512))     # start of the tape save area
+DEL_OFF=$((1018 * 512))    # delete request sector
 STARTUP=$FAT/linux/user-startup.sh
 SELF=$(readlink -f "$0")
 RUN=${JA_RUN:-/tmp}

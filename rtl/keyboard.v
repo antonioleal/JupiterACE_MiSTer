@@ -173,14 +173,14 @@ always @(posedge clk_sys) begin
 					else if(shift) keys[0][2] <= 0;
 					else keys[5][1] <= 0;
 				end
-			8'h52 : begin // " '
+			8'h52 : begin // ' "  (the Ace's SYMBOL SHIFT + 7 and SYMBOL SHIFT + P)
 					keys[0][1] <= press_n;
 					if(press_n) begin
-						keys[5][0] <= 1;
 						keys[4][3] <= 1;
+						keys[5][0] <= 1;
 					end
-					else if(shift) keys[4][3] <= 0;
-					else keys[5][0] <= 0;
+					else if(shift) keys[5][0] <= 0;
+					else keys[4][3] <= 0;
 				end
 			8'h4A : begin // / ?
 					keys[0][1] <= press_n;

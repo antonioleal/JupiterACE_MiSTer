@@ -23,8 +23,15 @@ module emu
 );
 
 assign ADC_BUS  = 'Z;
-assign USER_OUT = '1;
-assign {UART_RTS, UART_TXD, UART_DTR} = 0;
+// the Jupiter II Expansion's serial port: the MiSTer's UART (set up in the OSD's
+// UART Mode menu: USB serial adapter, Linux console, modem, ...) or the user port
+// (USER_IO 0 = RX, 1 = TX), Options -> Serial Port
+wire   uart_rxd, uart_txd;
+wire   ser_user = status[28];
+assign uart_rxd = ser_user ? USER_IN[0] : UART_RXD;
+assign UART_TXD = ser_user ? 1'b1 : uart_txd;
+assign USER_OUT = ser_user ? {5'h1F, uart_txd, 1'b1} : '1;
+assign {UART_RTS, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 assign {SDRAM_DQ, SDRAM_A, SDRAM_BA, SDRAM_CLK, SDRAM_CKE, SDRAM_DQML, SDRAM_DQMH, SDRAM_nWE, SDRAM_nCAS, SDRAM_nRAS, SDRAM_nCS} = 'Z;
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
@@ -55,7 +62,7 @@ video_freak video_freak
 
 `include "build_id.v"
 parameter CONF_STR = {
-	"JupiterACE;;",
+	"JupiterACE;UART9600:19200:4800:2400:1200:600:300;",
 	"-;",
 	"F1,ACE,Load Snapshot;",
 	"RE,Save Snapshot;",
@@ -84,10 +91,13 @@ parameter CONF_STR = {
 	"P1-;",
 	"P1O45,CPU Speed,Normal,x2,x4;",
 	"P1OMO,Memory,51K,35K,19K,3K,99K;",
+	"P1OPQ,Machine,Jupiter ACE,Jupiter II,Jupiter II + Exp;",
+	"P1OR,Inverse Video,Off,On;",
+	"P1OS,Serial Port,MiSTer UART,User Port;",
 	"-;",
 	"R0,Reset;",
 	"J,Fire;",
-	"I,Tape saved,New tape created,Tape full: save discarded,Save failed: bad block,Save failed: run JupiterACE.sh,Snapshot saved,Snapshot: run JupiterACE.sh,Snapshot failed: CPU busy,File deleted,Delete failed: see log,JupiterACE.sh not running,Delete: run JupiterACE.sh,Tape save failed: see log,Snapshot failed: see log,Spool done,Spool done with errors,Spool stopped: line not OK,Spool stopped,Dictionary saved,Dictionary failed: see log,Memory raised for snapshot,Snapshot failed: too big;",
+	"I,Tape saved,New tape created,Tape full: save discarded,Save failed: bad block,Save failed: run JupiterACE.sh,Snapshot saved,Snapshot: run JupiterACE.sh,Snapshot failed: CPU busy,File deleted,Delete failed: see log,JupiterACE.sh not running,Delete: run JupiterACE.sh,Tape save failed: see log,Snapshot failed: see log,Spool done,Spool done with errors,Spool stopped: line not OK,Spool stopped,Dictionary saved,Dictionary failed: see log,Memory raised for snapshot,Snapshot failed: too big,Snapshot needs Jupiter II+Exp,Snapshot is for Jupiter ACE/II;",
 	"V,v",`BUILD_DATE
 };
 
@@ -168,13 +178,13 @@ hps_io #(.CONF_STR(CONF_STR), .VDNUM(4)) hps_io
 	.sd_buff_din('{8'h00, f_din, 8'h00, 8'h00}),
 	.sd_buff_wr(sd_buff_wr),
 
-	.info_req(tape_msg | snap_msg | del_info_req | poll_info_req | sp_info_req | new_start | mem_raised),
-	.info(new_start ? 8'd2 : mem_raised ? 8'd21 : tape_msg ? tape_info : snap_msg ? snap_info : del_info_req ? del_info : poll_info_req ? poll_info : sp_info)
+	.info_req(tape_msg | snap_msg | del_info_req | poll_info_req | sp_info_req | new_start | mem_raised | ld_msg),
+	.info(new_start ? 8'd2 : mem_raised ? 8'd21 : ld_msg ? ld_msg_info : tape_msg ? tape_info : snap_msg ? snap_info : del_info_req ? del_info : poll_info_req ? poll_info : sp_info)
 );
 
 // SD slot 0: tape image (S0 option)
 // SD slot 1: games/JupiterACE/boot1.vhd, mounted when the core starts:
-//            sectors 0-420 snapshots, 421-677 tape saves, 678 delete
+//            sectors 0-760 snapshots, 761-1017 tape saves, 1018 delete
 //            requests. Only one of the three writers uses it at a time.
 // SD slot 2: the file picked in "Delete" (S2 option)
 // SD slot 3: the file picked in "Spool Forth File" (S3 option)
@@ -186,7 +196,7 @@ wire        sd_wr, sd_ack, snap_wr, snap_ack;
 wire [13:0] sd_buff_addr;
 wire  [7:0] sd_buff_din, snap_buff_din, sd_buff_dout;
 wire        sd_buff_wr;
-wire [31:0] f_lba  = snap_busy ? snap_lba : del_busy ? del_lba1 : poll_busy ? poll_lba : sd_lba + 32'd421;
+wire [31:0] f_lba  = snap_busy ? snap_lba : del_busy ? del_lba1 : poll_busy ? poll_lba : sd_lba + 32'd761;
 wire        f_wr   = snap_wr | sd_wr | del_wr1;
 wire        f_rd   = del_rd1 | poll_rd;
 wire  [7:0] f_din  = snap_busy ? snap_buff_din : del_busy ? del_din1 : sd_buff_din;
@@ -209,20 +219,59 @@ reg        loader_reset = 0;
 // loading ends the page in use is set to map onto physical page 0 (see ace.sv).
 // The memory is enlarged if the snapshot needs more than is set (its RAMTOP, or
 // data above the current memory, or the 96K block).
-reg  [1:0] ld_blk;          // 0 the image, 1 the block header, 2 the other page, 3 done
+reg  [2:0] ld_blk;          // 0 the image, 1 a block header, 2 the 96K pack's other page,
+                            // 3 done, 4 the Jupiter II Expansion's state
 reg  [3:0] ld_sig;
+reg        ld_m_a, ld_m_x, ld_m_j;   // the header so far matches ACE-96K, XACE96K, JUPITR2
 reg        ld_blk_seen, ld_blk_page, ld_r7;
-reg  [7:0] ld_rt_lo;
 reg  [2:0] ld_need;          // memory the snapshot needs (rank, see MEMORY)
 reg        ld_need_set;      // pulse
 reg        pg_set;           // pulse: loading ended, set the 96K page
 reg        pg_set_page;
-wire       ld_phys = (ld_blk == 2'd2);
+reg        ld_msg;           // pulse: a block for another machine was skipped ...
+reg  [7:0] ld_msg_info;      // ... this message
+reg        ay_mpage0;        // pulse: memory page 0 (see below)
+wire       ld_phys  = (ld_blk == 3'd2);
+wire       ld_state = (ld_blk == 3'd4);
+wire       ld_image = (ld_blk == 3'd0);   // the image: it holds the CPU registers
 
-function [7:0] sig96(input [3:0] i);
+// the Expansion's state, in the order of the JUPITR2 block (as snap_save.sv):
+// byte st_k goes to space st_sp, page st_pg, address st_addr (see ace.sv)
+reg [17:0] st_k;
+reg  [2:0] st_sp;
+reg  [1:0] st_pg;
+reg [15:0] st_addr;
+reg [17:0] st_o;
+wire [7:0] port_b_out;
+always @(*) begin
+	st_sp = 3'd5; st_pg = 2'd0; st_addr = 16'd0; st_o = 18'd0;
+	if(st_k < 18'd19) ;
+	else if(st_k < 18'd1043) begin st_sp = 3'd1; st_pg = {1'b0, ~port_b_out[2]}; st_o = st_k - 18'd19;   st_addr = 16'h2000 + st_o[9:0]; end
+	else if(st_k < 18'd2067) begin st_sp = 3'd2; st_pg = {1'b0, ~port_b_out[3]}; st_o = st_k - 18'd1043; st_addr = 16'h2800 + st_o[9:0]; end
+	else if(st_k < 18'd3091) begin st_sp = 3'd3; st_pg = 2'd0; st_o = st_k - 18'd2067; st_addr = {6'd0, st_o[9:0]}; end
+	else if(st_k < 18'd4115) begin st_sp = 3'd3; st_pg = 2'd1; st_o = st_k - 18'd3091; st_addr = {6'd0, st_o[9:0]}; end
+	else begin st_sp = 3'd4; st_o = st_k - 18'd4115; st_pg = st_o[16:15]; st_addr = {1'b1, st_o[14:0]}; end
+end
+wire       ay_ld      = ld_state & loader_wr & (st_k < 18'd17);
+reg        xs_swap_set;      // pulse: after the registers, the pages shown are known
+reg        xs_sswap, xs_cswap;
+
+function [7:0] sig_a(input [2:0] i);     // ACE-96K (Jupiter-IIb, xAce from now)
 	case(i)
-		0: sig96 = "X"; 1: sig96 = "A"; 2: sig96 = "C"; 3: sig96 = "E";
-		4: sig96 = "9"; 5: sig96 = "6"; 6: sig96 = "K"; default: sig96 = 8'h01;
+		0: sig_a = "A"; 1: sig_a = "C"; 2: sig_a = "E"; 3: sig_a = "-";
+		4: sig_a = "9"; 5: sig_a = "6"; default: sig_a = "K";
+	endcase
+endfunction
+function [7:0] sig_x(input [2:0] i);     // XACE96K (xAce until now)
+	case(i)
+		0: sig_x = "X"; 1: sig_x = "A"; 2: sig_x = "C"; 3: sig_x = "E";
+		4: sig_x = "9"; 5: sig_x = "6"; default: sig_x = "K";
+	endcase
+endfunction
+function [7:0] sig_j(input [2:0] i);     // JUPITR2
+	case(i)
+		0: sig_j = "J"; 1: sig_j = "U"; 2: sig_j = "P"; 3: sig_j = "I";
+		4: sig_j = "T"; 5: sig_j = "R"; default: sig_j = "2";
 	endcase
 endfunction
 
@@ -235,44 +284,92 @@ always @(posedge clk_sys) begin
 	old_download <= ioctl_download;
 	ld_need_set  <= 0;
 	pg_set       <= 0;
+	ld_msg       <= 0;
+	ay_mpage0    <= 0;
+	xs_swap_set  <= 0;
 
 	loader_reset <= 0;
 	if(~old_download && ioctl_download && ioctl_index[5:0] == 1) begin
 		loader_addr <= 'h2000;
 		status <= 0;
 		loader_reset <=1;
+		// hold the CPU from now on, not from the first byte: while the file is
+		// being read the CPU would otherwise restart, and with the Expansion its
+		// start-up code changes the pages shown before the image is loaded
+		loader_en <= 1;
 		ioctl_wait <= 1;
 		timeout <= 3000000;
 		cnt <= 0;
 		ld_blk      <= 0;
-		ld_sig      <= 0;
 		ld_blk_seen <= 0;
 		ld_r7       <= 0;
+		xs_swap_set <= 1;            // the image goes into page 1 of each pair
+		xs_sswap    <= 0;
+		xs_cswap    <= 0;
 	end
 
 	loader_wr <= 0;
 	if(loader_wr) begin
-		loader_addr <= loader_addr + 1'd1;
-		// what the snapshot needs: bit 7 of R, RAMTOP, and memory above the current size
-		if(loader_addr == 16'h2140) ld_r7 <= loader_data[7];
-		if(loader_addr == 16'h3C18) ld_rt_lo <= loader_data;
-		if(loader_addr == 16'h3C19) begin
-			ld_need_set <= 1;
-			ld_need     <= (loader_data == 8'h00) ? 3'd3 : (loader_data <= 8'h40) ? 3'd0 :
-			               (loader_data <= 8'h80) ? 3'd1 : (loader_data <= 8'hC0) ? 3'd2 : 3'd3;
+		// (the Expansion's state has its own addresses: the image's count stops)
+		if(!ld_state) loader_addr <= loader_addr + 1'd1;
+		if(ld_blk == 3'd0) begin
+			// what the snapshot needs: bit 7 of R, RAMTOP, and memory above the current size
+			if(loader_addr == 16'h2140) ld_r7 <= loader_data[7];
+			if(loader_addr == 16'h3C19) begin
+				ld_need_set <= 1;
+				ld_need     <= (loader_data == 8'h00) ? 3'd3 : (loader_data <= 8'h40) ? 3'd0 :
+				               (loader_data <= 8'h80) ? 3'd1 : (loader_data <= 8'hC0) ? 3'd2 : 3'd3;
+				// the Expansion: a snapshot using RAM above C000 needs memory page 0
+				// there, not the Expansion ROM (as Jupiter-IIb does)
+				if(mach == 2'd2 && (loader_data == 8'h00 || loader_data > 8'hC0)) ay_mpage0 <= 1;
+			end
+			if(loader_addr[15:14] != 2'b00) begin
+				ld_need_set <= 1;
+				ld_need     <= {1'b0, loader_addr[15:14]};   // 4000: 19K, 8000: 35K, C000: 51K
+			end
 		end
 		if(ld_phys) begin ld_need_set <= 1; ld_need <= 3'd4; end
-		else if(loader_addr[15:14] != 2'b00) begin
-			ld_need_set <= 1;
-			ld_need     <= {1'b0, loader_addr[15:14]};   // 4000: 19K, 8000: 35K, C000: 51K
+		if(ld_state) begin
+			st_k <= st_k + 1'd1;
+			// the registers are in: the pages shown are now known
+			if(st_k == 18'd18) begin
+				xs_swap_set <= 1;
+				xs_sswap    <= port_b_out[2] ^ 1'b1;
+				xs_cswap    <= port_b_out[3] ^ 1'b1;
+			end
 		end
 	end
 
 	if(ioctl_wr && ioctl_index[5:0] == 1) begin
 		loader_en <= 1;
-		if(ld_blk == 2'd1) begin
-			// "XACE96K" 01 <page>
-			if(ld_sig == 4'd8) begin
+		if(ld_blk == 3'd1) begin
+			// a block after the image: "ACE-96K" / "XACE96K" 01 <page>, or "JUPITR2" 01
+			if(ld_sig < 4'd7) begin
+				if(ioctl_dout != sig_a(ld_sig[2:0])) ld_m_a <= 0;
+				if(ioctl_dout != sig_x(ld_sig[2:0])) ld_m_x <= 0;
+				if(ioctl_dout != sig_j(ld_sig[2:0])) ld_m_j <= 0;
+				ld_sig <= ld_sig + 1'd1;
+			end
+			else if(ld_sig == 4'd7) begin
+				if(ioctl_dout != 8'h01 || !(ld_m_a | ld_m_x | ld_m_j)) ld_blk <= 3;
+				else if(ld_m_j) begin
+					if(mach == 2'd2) begin
+						ld_blk <= 4;
+						st_k   <= 0;
+						status <= 0;
+					end
+					else begin
+						ld_blk <= 3;
+						ld_msg <= 1; ld_msg_info <= 8'd23;   // needs the Jupiter II + Expansion
+					end
+				end
+				else if(mach == 2'd2) begin
+					ld_blk <= 3;
+					ld_msg <= 1; ld_msg_info <= 8'd24;       // a 96K pack: not with the Expansion
+				end
+				else ld_sig <= 4'd8;
+			end
+			else begin
 				if(ioctl_dout[7:1]) ld_blk <= 3;
 				else begin
 					ld_blk_page <= ioctl_dout[0];
@@ -282,10 +379,8 @@ always @(posedge clk_sys) begin
 					status      <= 0;
 				end
 			end
-			else if(ioctl_dout != sig96(ld_sig)) ld_blk <= 3;
-			else ld_sig <= ld_sig + 1'd1;
 		end
-		else if(ld_blk != 2'd3) case(status)
+		else if(ld_blk != 3'd3) case(status)
 			0: if(ioctl_dout == 'hED) status <= 1;
 				else begin
 					loader_wr <= 1;
@@ -294,9 +389,14 @@ always @(posedge clk_sys) begin
 			1: begin
 					cnt <= ioctl_dout;
 					if(ioctl_dout) status <= 2'd2;
-					else begin                          // ED 00: end of the image (or of the 96K block)
+					else begin                          // ED 00: the end of the image or of a block
 						status <= 2'd0;
-						ld_blk <= (ld_blk == 2'd0) ? 2'd1 : 2'd3;
+						if(ld_blk == 3'd0) begin
+							ld_blk <= 3'd1;
+							ld_sig <= 0;
+							ld_m_a <= 1; ld_m_x <= 1; ld_m_j <= 1;
+						end
+						else ld_blk <= 3'd3;
 					end
 				end
 			2: begin
@@ -331,6 +431,12 @@ end
 // RAM test finds the new size. A snapshot that needs more memory enlarges it
 // until the option is changed again.
 wire [2:0] mem_opt  = status[24:22];
+
+// Options -> Machine: 0 Jupiter Ace, 1 Jupiter II, 2 Jupiter II + Expansion (see
+// ace.sv); changing it restarts the machine. The Memory option is for the
+// Jupiter Ace and the Jupiter II without the Expansion, which has its own.
+wire [1:0] mach    = (status[26:25] == 2'd3) ? 2'd0 : status[26:25];
+wire       inverse = status[27];
 wire [2:0] mem_want = (mem_opt == 3'd1) ? 3'd2 : (mem_opt == 3'd2) ? 3'd1 :
                       (mem_opt == 3'd3) ? 3'd0 : (mem_opt == 3'd4) ? 3'd4 : 3'd3;
 reg  [2:0] mem_rank = 3'd3;
@@ -339,18 +445,20 @@ reg        mem_cold;         // pulse: the memory is new (96K page mapping clear
 reg        mem_raised;       // pulse: enlarged for a snapshot
 always @(posedge clk_sys) begin
 	reg [2:0] old_opt = 0;
+	reg [1:0] old_mach = 0;
 
 	mem_cold   <= 0;
 	mem_raised <= 0;
 	old_opt    <= mem_opt;
+	old_mach   <= mach;
 	if(mem_rst) mem_rst <= mem_rst - 1'd1;
 
-	if(old_opt != mem_opt) begin
+	if(old_opt != mem_opt || old_mach != mach) begin
 		mem_rank <= mem_want;
 		mem_rst  <= '1;
 		mem_cold <= 1;
 	end
-	else if(ld_need_set && ld_need > mem_rank) begin
+	else if(ld_need_set && ld_need > mem_rank && mach != 2'd2) begin
 		mem_rank   <= ld_need;
 		mem_raised <= 1;
 	end
@@ -389,9 +497,14 @@ snap_save snap_save
 	.held(snap_held),
 	.halted(cpu_halted),
 	.cpu_reg(cpu_reg),
-	.mem_rank(mem_rank),
+	.mem_rank((mach == 2'd2) ? 3'd3 : mem_rank),   // the Expansion: all of memory, to FFFF
 	.pack_page(page),
 	.other(snap_other),
+	.j2x(mach == 2'd2),
+	.ay_regs(ay_regs),
+	.port_b(port_b_out),
+	.xs_space(snap_xs_space),
+	.xs_pg(snap_xs_pg),
 	.mem_en(snap_en),
 	.mem_addr(snap_addr),
 	.mem_data(snap_data),
@@ -790,7 +903,8 @@ wire mic,spk;
 wire [7:0] kbd_row;
 wire [4:0] kbd_col, kbd_col_kb, kbd_col_sp;
 assign kbd_col = sp_active ? kbd_col_sp : kbd_col_kb;   // the keyboard is ignored while spooling
-wire       video_out;
+wire [3:0] vid_r, vid_g, vid_b;
+wire [13:0] ay_a, ay_b, ay_c;
 
 // system variable writes (for the spooler) and the spooling frame interrupt
 wire        sv_we;
@@ -798,9 +912,17 @@ wire  [5:0] sv_addr;
 wire  [7:0] sv_data;
 wire        int_fast, int_fast_n;
 
+wire [7:0] ay_regs[17];
+wire [2:0] snap_xs_space;
+wire [1:0] snap_xs_pg;
+
 ace ace
 (
 	.*,
+	.loader_addr(ld_state ? st_addr : loader_addr),
+	.xs_space(loader_en ? (ld_state ? st_sp : 3'd0) : snap_xs_space),
+	.xs_pg(loader_en ? st_pg : snap_xs_pg),
+	.ay_ld_idx(st_k[4:0]),
 	.clk(clk_sys),
 	.no_wait(|turbo | fast_load),
 	.reset(reset|loader_reset)
@@ -858,8 +980,11 @@ end
 
 wire [1:0] scale = status[3:2];
 
-assign AUDIO_L = {1'b0, spk, mic, tape_in & tape_playing & ~status[7], 12'd0};
-assign AUDIO_R = AUDIO_L;
+// the beeper (and tape) on both sides; with the Expansion its sound chip: A left,
+// B right, C on both
+wire [15:0] beep = {1'b0, spk, mic, tape_in & tape_playing & ~status[7], 12'd0};
+assign AUDIO_L = beep + ay_a + ay_c;
+assign AUDIO_R = beep + ay_b + ay_c;
 assign AUDIO_MIX = 0;
 assign AUDIO_S = 0;
 
@@ -868,7 +993,7 @@ assign CLK_VIDEO = clk_sys;
 assign VGA_SL = scale ? scale - 1'd1 : 2'd0;
 assign VGA_F1 = 0;
 
-video_mixer #(280, 1) mixer
+video_mixer #(320, 1) mixer
 (
 	.*,
 	.freeze_sync(),
@@ -876,9 +1001,9 @@ video_mixer #(280, 1) mixer
 	.scandoubler(scale || forced_scandoubler),
 	.gamma_bus(),
 
-	.R({4{video_out}}),
-	.G({4{video_out}}),
-	.B({4{video_out}}),
+	.R(vid_r),
+	.G(vid_g),
+	.B(vid_b),
 
 	.HSync(~hsync),
 	.VSync(~vsync),

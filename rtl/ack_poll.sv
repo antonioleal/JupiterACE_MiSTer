@@ -2,13 +2,13 @@
 //  Jupiter Ace: wait for JupiterACE.sh to handle a save
 //
 //  After a snapshot (header at sector 0 of boot1.vhd) or a tape save (header
-//  at sector 421) is written, the script copies it out and sets the header's
+//  at sector 761) is written, the script copies it out and sets the header's
 //  state byte (offset 12) to 3 (done) or 4 (failed). This module reads those
 //  headers back until it sees the answer, then shows it on the OSD; with no
 //  answer after about 8 s it reports that the script is not running.
 //
 //  Main_MiSTer caches 32 sectors of reads per disk, so each check first reads
-//  the other header sector (421 sectors away) and then the wanted one: every
+//  the other header sector (761 sectors away) and then the wanted one: every
 //  read then comes from the file.
 //
 //  This program is free software; you can redistribute it and/or modify it
@@ -49,7 +49,7 @@ localparam INFO_DICT_OK   = 8'd19;
 localparam INFO_DICT_FAIL = 8'd20;
 
 localparam SNAP_LBA = 32'd0;
-localparam TAPE_LBA = 32'd421;
+localparam TAPE_LBA = 32'd761;
 
 reg        pend_s = 0, pend_t = 0;  // waiting for an answer
 reg        dict_s;                  // the snapshot area holds a dictionary dump

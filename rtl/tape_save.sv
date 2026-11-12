@@ -4,7 +4,7 @@
 //  Decodes the MIC output while the ROM SAVE routine (0x1820) runs, appends
 //  each saved program (header block + data block) to the tape in the tape
 //  buffer, and writes everything saved since the tape was inserted to the
-//  tape save area of games/JupiterACE/boot1.vhd (sectors 421-677), which
+//  tape save area of games/JupiterACE/boot1.vhd (sectors 761-1017), which
 //  Main_MiSTer mounts on SD slot 1 when the core starts. sd_lba here counts
 //  from the start of that area. The JupiterACE.sh script on the MiSTer
 //  creates the file and merges the saves into the inserted .tap/.tzx file,
@@ -133,7 +133,7 @@ always @(posedge clk) begin
 	end
 
 	// snapshot area + this area (header + 128 KB each)
-	if(img_mounted) sav_ok <= ~img_readonly && (img_size >= 64'd347648);   // all of boot1.vhd: 679 sectors
+	if(img_mounted) sav_ok <= ~img_readonly && (img_size >= 64'd521728);   // all of boot1.vhd: 1019 sectors
 end
 
 /////////////////  MIC decoder  /////////////////

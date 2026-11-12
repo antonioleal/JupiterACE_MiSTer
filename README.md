@@ -1,6 +1,9 @@
 ## Jupiter Ace for MiSTer FPGA
 
 ### Features
+- Three machines: the Jupiter Ace, the Jupiter II, and the Jupiter II with its
+  Expansion board (colour, sound, 128K of paged RAM, a serial port, the
+  Expansion ROM's Forth words)
 - Memory 3K, 19K, 35K, 51K (default) or 99K with Edwin Blink's 96K RAM pack
 - CPU speed Normal, x2 and x4
 - Scandoubler with HQ2x
@@ -28,7 +31,7 @@ script, installed once:
 3. Copy `scripts/JupiterACE.sh` to `/media/fat/Scripts/`.
 4. On the MiSTer, open the OSD **Scripts** menu and run `JupiterACE`.
    It:
-   - creates `games/JupiterACE/boot1.vhd` (339.5 KB, fixed size), the file
+   - creates `games/JupiterACE/boot1.vhd` (509.5 KB, fixed size), the file
      the core writes snapshots, tape saves and delete requests into;
    - adds itself to `/media/fat/linux/user-startup.sh`, so it starts at
      every boot;
@@ -66,12 +69,87 @@ reboot.
 ### Saving your OSD settings
 The tape and display options (Tape Auto Play, Tape Auto Rewind, Tape Sound,
 Tape Fast Load, Tape Fast Save, New Tape Format, Aspect ratio, Scandoubler Fx,
-Scale, CPU Speed and Memory) are in OSD → **Options**.
+Scale, CPU Speed, Memory, Machine, Inverse Video and Serial Port) are in OSD → **Options**.
 
 OSD options are kept only once you save them: set them, press **Right** on
 the OSD to go to its second page, and choose **Save settings**. They are
 stored in `/media/fat/config/JupiterACE.CFG` and loaded every time the core
 starts. **Reset settings** on the same page goes back to the defaults.
+
+### Machines
+OSD → **Options** → **Machine** chooses the computer; changing it restarts it.
+
+| Machine | What it is |
+|---|---|
+| **Jupiter ACE** (default) | The original Jupiter Ace: 50 Hz, 1K of program RAM, white on black. **Memory** chooses its RAM pack. |
+| **Jupiter II** | Ricardo Fernandes Lopes' [Jupiter II](https://github.com/ricaflops/Jupiter-II), a Jupiter Ace remake that runs the Ace ROM and its software: 60 Hz (NTSC, 262 lines, 59.64 Hz), 2K of program RAM at `3000-37FF` (seen again at `3800-3FFF`), two pages of screen and character set RAM. **Memory** chooses its RAM pack, as on the Ace. |
+| **Jupiter II + Exp** | The Jupiter II with its [Expansion board](https://github.com/ricaflops/Jupiter-II-Expansion): the Expansion ROM starts with its own screen and a chime, then Forth with the extra words below; colour; sound; 128K of paged RAM (the **Memory** option does not apply). |
+
+This follows the hardware as emulated by
+[Jupiter-IIb](https://github.com/antonioleal/Jupiter-IIb), from the Jupiter
+II's schematics, PLD equations and ROM source.
+
+**Inverse Video** (Jupiter II) is the Jupiter II's inverse video jumper: black
+on white, or with the Expansion INK and PAPER swapped.
+
+**The Expansion board:**
+
+- **Colour:** 16 colours, IRGB (bit 3 intensity): `BLACK` 0, `BLUE` 9, `RED` 12,
+  `PURPLE` 13, `GREEN` 10, `CYAN` 11, `YELLOW` 14, `WHITE` 15, `GREY` 8; `DARK`
+  clears the intensity bit. Each character cell has its own INK and PAPER, taken
+  from the current `INK` / `PAPER` when a character is written; the border has
+  its own colour (`BORDER`).
+
+      CYAN BORDER  WHITE PAPER  BLUE DARK INK  CLS
+
+- **Memory:** `4000-7FFF` is always the same 16K; `8000-FFFF` is memory page 0,
+  1 or 2 (32K of RAM each) or page 3 (16K of RAM and the Expansion ROM at
+  `C000`). `n MPAGE`, `n SCREEN` and `n FONT` choose the memory, screen and
+  character set pages; a reset selects page 3, screen 1 and character set 1.
+  Forth's RAMTOP is `8000`, below the paged memory.
+- **Sound:** an AY-3-8910 at 3.25 MHz: three tone channels, noise and
+  envelopes. `PSG!` ( value register -- ) writes a register and `PSG@`
+  ( register -- value ) reads one; a tone of period *t* has a frequency of
+  203125 / *t* Hz. Channel A plays on the left, B on the right, C and the beeper
+  on both.
+
+      : PING 200 0 PSG! 254 7 PSG! 16 8 PSG! 20 12 PSG! 1 13 PSG! ;
+
+- **Other words:** `COUNT`, `+!`, `?`, `CMOVE`, `FILL`, `DEPTH`, `HEX`.
+- **Snapshots** save and load the whole machine, as
+  [Jupiter-IIb](https://github.com/antonioleal/Jupiter-IIb) does: the memory
+  as the Z80 sees it (`2000-FFFF`), then, after the end marker, a block that
+  starts with `JUPITR2`: the sound chip's registers (and so the colours and
+  pages chosen), the screen and character set pages not shown, the colours of
+  both screen pages and all four memory pages. Other emulators load such a file
+  as a 51K Ace snapshot of the memory shown. A snapshot of another machine that
+  uses RAM above `C000` is loaded with memory page 0 there.
+- **Serial port:** a 16C450 UART at odd ports `E1h - EFh` (register *r* at
+  `E1h + 2r`), 8 data bits, 1 stop bit, no parity, 9600 baud after a reset.
+  `n BAUD` changes the speed (300 to 19200); `addr n TX` sends n bytes and
+  `addr n RX` receives n bytes into memory (Space stops both). Bytes take as
+  long as at the chosen speed. See *Serial port* below for connecting it.
+
+### Serial port
+The Jupiter II Expansion's serial port goes to one of two places, chosen with
+OSD → **Options** → **Serial Port**:
+
+- **MiSTer UART** (default): the MiSTer's own serial port, connected in the
+  OSD's **UART Mode** menu (press **Right** on the OSD to reach the second
+  page). There, **Connection** chooses what the MiSTer's Linux connects to the
+  port (a console, a modem over the network, MIDI, ...), and **Baud** must match
+  the speed the Ace program uses (9600 unless it ran `BAUD`). With
+  **Connection: None** the port
+  is `/dev/ttyS1` on the MiSTer's Linux, for example from an ssh session:
+
+      stty -F /dev/ttyS1 9600 raw -echo
+      cat /dev/ttyS1                # what the Ace sends
+      printf 'HELLO' > /dev/ttyS1   # bytes for the Ace to receive
+
+- **User Port**: the MiSTer's user port (USB 3 type connector, SNAC), with RX
+  on USER_IO 0 and TX on USER_IO 1, 3.3 V levels.
+
+The serial port only exists with **Machine** set to Jupiter II + Exp.
 
 ### Memory
 OSD → **Options** → **Memory** chooses how much RAM the Ace has:
@@ -101,8 +179,9 @@ should run below `4000`. A reset goes back to page 0.
 **Snapshots and memory:** a snapshot records the memory size at `2080` and
 holds memory up to RAMTOP, as other emulators expect. With the 96K pack the
 page in use is saved as usual and the other page follows the end marker
-(`XACE96K`, as xAce does); other emulators stop at the end marker and load it
-as a 51K snapshot. Loading a snapshot that needs more memory than is set (by
+(`ACE-96K`, as Jupiter-IIb and xAce-baremetal write it; `XACE96K`, from older
+versions of xAce-baremetal, is read too); other emulators stop at the end marker
+and load it as a 51K snapshot. Loading a snapshot that needs more memory than is set (by
 its RAMTOP, its size, or a 96K page) enlarges the memory for it: the OSD shows
 "Memory raised for snapshot", and **Memory** in the OSD keeps your setting
 until you change it.
@@ -264,6 +343,8 @@ Messages appear while the OSD is closed.
 | Snapshot failed: see log | The script could not write the snapshot file. |
 | Snapshot failed: too big | A 99K snapshot did not fit in `boot1.vhd` (only with memory that packs badly). |
 | Memory raised for snapshot | The snapshot needed more memory than set; it was enlarged for it. |
+| Snapshot needs Jupiter II+Exp | The snapshot has the Jupiter II Expansion's state: set **Machine** to Jupiter II + Exp and load it again. Its memory was loaded without that state. |
+| Snapshot is for Jupiter ACE/II | A 96K RAM pack snapshot loaded on the Jupiter II + Exp, which has no RAM pack: set **Machine** to Jupiter ACE or Jupiter II and load it again. |
 | File deleted | The file was moved to `deleted/`, or erased if it was already there. |
 | Delete failed: see log | The script could not find or move the file. |
 | Delete: run JupiterACE.sh | `boot1.vhd` is missing: install the script, then load the core again. |
@@ -292,3 +373,9 @@ Needs Quartus Prime Lite 17.0.2 on Linux.
 Based on the [Jupiter Ace core for MiSTer](https://github.com/MiSTer-devel/Jupiter_MiSTer)
 by Sorgelig, with the T80 Z80 CPU core and the MiSTer framework. Licensed
 under the GNU General Public License, version 2 or later.
+
+The Jupiter II and its Expansion board are Ricardo Fernandes Lopes' designs
+([Jupiter-II](https://github.com/ricaflops/Jupiter-II),
+[Jupiter-II-Expansion](https://github.com/ricaflops/Jupiter-II-Expansion), MIT
+licence); `rtl/xrom.mif` is the Expansion ROM from the latter, unchanged, with
+its MIT notice. The 96K RAM pack is Edwin Blink's design.

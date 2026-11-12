@@ -47,6 +47,13 @@ module snap_save
 	input       [2:0] mem_rank,     // 0 = 3K, 1 = 19K, 2 = 35K, 3 = 51K, 4 = 99K (96K pack)
 	input             pack_page,    // the 96K pack's page in use
 	output reg        other = 0,    // reading the 96K pack's other page
+
+	// the Jupiter II Expansion's state (see ace.sv): read through a "space"
+	input             j2x,
+	input       [7:0] ay_regs[17],  // the sound chip's registers, and the one selected
+	input       [7:0] port_b,
+	output reg  [2:0] xs_space = 0,
+	output reg  [1:0] xs_pg,
 	input     [211:0] cpu_reg,      // IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
 	output reg        mem_en,
 	output reg [15:0] mem_addr,
@@ -75,9 +82,10 @@ localparam INFO_NOFILE = 8'd7;
 localparam INFO_BUSY   = 8'd8;
 localparam INFO_TOOBIG = 8'd22;
 
-localparam FILE_SECTORS = 679;  // all of boot1.vhd (snapshot area: header + 420 sectors,
-                                // more than the worst case packing of a 99K snapshot)
-localparam DATA_SECTORS = 420;
+localparam FILE_SECTORS = 1019; // all of boot1.vhd (snapshot area: header + 760 sectors,
+                                // more than the worst case packing of a Jupiter II
+                                // Expansion snapshot, about 385 KB)
+localparam DATA_SECTORS = 760;
 
 // the snapshot file is usable
 reg file_ok = 0;
@@ -97,14 +105,46 @@ wire [16:0] end_a = (dict || other) ? 17'hFFFF : {1'b0, rt_hi - 1'd1, 8'hFF};
 reg         page_r;      // page in use when stopped
 reg  [3:0]  si;
 
-// after the image of a 96K pack's page in use: "XACE96K" 01 <page>, then its other page
+// after the image (each block ends with ED 00), as Jupiter-IIb writes it:
+//   96K pack:  "ACE-96K" 01 <page in use>, then the other page 4000-FFFF
+//   Jupiter II Expansion: "JUPITR2" 01, then its state (XS_SIZE bytes):
+//     16 sound chip registers, the register selected, 2 spare (0), the screen
+//     page not shown (1K), the character set page not shown (1K), the
+//     attributes of screen page 0 and 1 (1K each), memory pages 0-3 (32K each)
 function [7:0] sig96(input [3:0] i, input p);
 	case(i)
-		0: sig96 = "X"; 1: sig96 = "A"; 2: sig96 = "C"; 3: sig96 = "E";
+		0: sig96 = "A"; 1: sig96 = "C"; 2: sig96 = "E"; 3: sig96 = "-";
 		4: sig96 = "9"; 5: sig96 = "6"; 6: sig96 = "K"; 7: sig96 = 8'h01;
 		default: sig96 = {7'd0, p};
 	endcase
 endfunction
+function [7:0] sigj2(input [3:0] i);
+	case(i)
+		0: sigj2 = "J"; 1: sigj2 = "U"; 2: sigj2 = "P"; 3: sigj2 = "I";
+		4: sigj2 = "T"; 5: sigj2 = "R"; 6: sigj2 = "2"; default: sigj2 = 8'h01;
+	endcase
+endfunction
+
+localparam [17:0] XS_LAST = 18'd135186;    // XS_SIZE - 1
+reg        xst = 0;        // writing the Expansion's state
+reg        xdone;
+reg [17:0] stk;            // state byte
+
+// where state byte stk comes from: space, page, address
+reg  [2:0] xsp;
+reg  [1:0] xpg;
+reg [15:0] xaddr;
+reg [17:0] xo;
+always @(*) begin
+	xsp = 3'd5; xpg = 2'd0; xaddr = 16'd0; xo = 18'd0;
+	if(stk < 18'd19) ;
+	else if(stk < 18'd1043) begin xsp = 3'd1; xpg = {1'b0, ~port_b[2]}; xo = stk - 18'd19;   xaddr = 16'h2000 + xo[9:0]; end
+	else if(stk < 18'd2067) begin xsp = 3'd2; xpg = {1'b0, ~port_b[3]}; xo = stk - 18'd1043; xaddr = 16'h2800 + xo[9:0]; end
+	else if(stk < 18'd3091) begin xsp = 3'd3; xpg = 2'd0; xo = stk - 18'd2067; xaddr = {6'd0, xo[9:0]}; end
+	else if(stk < 18'd4115) begin xsp = 3'd3; xpg = 2'd1; xo = stk - 18'd3091; xaddr = {6'd0, xo[9:0]}; end
+	else begin xsp = 3'd4; xo = stk - 18'd4115; xpg = xo[16:15]; xaddr = {1'b1, xo[14:0]}; end
+end
+wire [7:0] xreg = (stk < 18'd17) ? ay_regs[stk[4:0]] : 8'h00;
 
 // the byte of the 2000-23FF page at the source address
 reg [16:0] a;          // source address
@@ -146,7 +186,7 @@ always @(posedge clk) obuf_q <= obuf[sd_buff_addr];
 
 reg [31:0] seq = 0;
 reg  [7:0] hstate;
-reg [16:0] olen;       // .ACE bytes so far
+reg [18:0] olen;       // .ACE bytes so far
 
 reg [7:0] hbyte;
 always @(*) begin
@@ -156,7 +196,7 @@ always @(*) begin
 		8: hbyte = seq[7:0];   9: hbyte = seq[15:8];   10: hbyte = seq[23:16];   11: hbyte = seq[31:24];
 		12: hbyte = hstate;
 		13: hbyte = {7'd0, dict};
-		16: hbyte = olen[7:0]; 17: hbyte = olen[15:8]; 18: hbyte = {7'd0, olen[16]};
+		16: hbyte = olen[7:0]; 17: hbyte = olen[15:8]; 18: hbyte = {5'd0, olen[18:16]};
 		default: hbyte = 0;
 	endcase
 end
@@ -179,6 +219,7 @@ localparam S_HDR2  = 4'd10;
 localparam S_DONE  = 4'd11;
 localparam S_AFTER = 4'd12;  // after an end marker: the 96K pack's other page, or done
 localparam S_SIG   = 4'd13;
+localparam S_SIG2  = 4'd14;  // the Expansion's block header
 
 reg  [3:0] state = S_IDLE;
 reg  [3:0] ret, emit_ret;
@@ -238,6 +279,9 @@ always @(posedge clk) begin
 				halted_r <= halted;
 				page_r   <= pack_page;
 				other    <= 0;
+				xst      <= 0;
+				xdone    <= 0;
+				xs_space <= 0;
 				mem_en   <= 1;
 				a        <= dict ? 17'h0000 : 17'h2000;
 				rc       <= 0;
@@ -270,7 +314,9 @@ always @(posedge clk) begin
 			end
 
 		S_FETCH: begin
-				mem_addr <= a[15:0];
+				mem_addr <= xst ? xaddr : a[15:0];
+				xs_space <= xst ? xsp : 3'd0;
+				xs_pg    <= xpg;
 				wt       <= 2;
 				state    <= S_WAIT;
 			end
@@ -278,7 +324,8 @@ always @(posedge clk) begin
 		S_WAIT:
 			if(wt) wt <= wt - 1'd1;
 			else begin
-				b     <= (!dict && a < 17'h2400) ? page : mem_data;
+				b     <= xst ? ((stk < 18'd19) ? xreg : mem_data) :
+				         (!dict && a < 17'h2400) ? page : mem_data;
 				state <= S_BYTE;
 			end
 
@@ -311,7 +358,14 @@ always @(posedge clk) begin
 			end
 
 		S_NEXT:
-			if(a == end_a) begin
+			if(xst) begin
+				if(stk == XS_LAST) state <= S_FIN;
+				else begin
+					stk   <= stk + 1'd1;
+					state <= S_FETCH;
+				end
+			end
+			else if(a == end_a) begin
 				if(dict) begin
 					mem_en <= 0;
 					state  <= S_LAST;
@@ -334,6 +388,8 @@ always @(posedge clk) begin
 					// the snapshot area is full: give up
 					mem_en <= 0;
 					other  <= 0;
+					xst    <= 0;
+					xs_space <= 0;
 					hold   <= 0;
 					info   <= INFO_TOOBIG; info_req <= 1;
 					state  <= S_IDLE;
@@ -361,14 +417,37 @@ always @(posedge clk) begin
 			end
 
 		S_AFTER:
-			if(mem_rank == 3'd4 && !other) begin
+			if(j2x && !xst && !xdone) begin
+				si    <= 0;
+				state <= S_SIG2;
+			end
+			else if(!j2x && mem_rank == 3'd4 && !other) begin
 				si    <= 0;
 				state <= S_SIG;
 			end
 			else begin
-				mem_en <= 0;
-				other  <= 0;
-				state  <= S_LAST;
+				mem_en   <= 0;
+				other    <= 0;
+				xst      <= 0;
+				xs_space <= 0;
+				state    <= S_LAST;
+			end
+
+		S_SIG2:
+			if(si == 4'd8) begin
+				xst   <= 1;
+				xdone <= 1;
+				stk   <= 0;
+				rc    <= 0;
+				state <= S_FETCH;
+			end
+			else begin
+				q[0]     <= sigj2(si);
+				qn       <= 1;
+				qi       <= 0;
+				si       <= si + 1'd1;
+				emit_ret <= S_SIG2;
+				state    <= S_EMIT;
 			end
 
 		S_SIG:
