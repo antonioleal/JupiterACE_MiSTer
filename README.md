@@ -9,15 +9,16 @@
 - Scandoubler with HQ2x
 - Loads and saves `.ace` snapshots (SNAP001.ace, SNAP002.ace, ...)
 - Loads `.tap` and `.tzx` tapes (up to 128KB), with optional auto play,
-  auto rewind and 8x fast load
+  auto rewind and 8x fast loading
 - Saves to tape with `SAVE` / `BSAVE`: onto the inserted tape (replacing a
   program with the same name, with backups of the old version), or onto a new
-  `.tap` or `.tzx` tape named after the program; optional 8x fast save
+  `.tap` or `.tzx` tape named after the program; optional 8x fast saving
 - Spools Forth source files (`.fth`) into the Ace, typed 8x
   faster than by hand
 - Saves the dictionary as a Forth source file (DICT001.fth, ...) that spools
   back
 - Deletes `.tap`, `.tzx`, `.ace` and `.fth` files from the OSD (recoverable for 30 days)
+- Not supported: loading from or saving to a real cassette recorder
 
 ### Install
 1. Copy `JupiterACE.rbf` to the root of the SD card (or to `_Computer/`).
@@ -68,7 +69,7 @@ reboot.
 
 ### Saving your OSD settings
 The tape and display options (Tape Auto Play, Tape Auto Rewind, Tape Sound,
-Tape Fast Load, Tape Fast Save, New Tape Format, Aspect ratio, Scandoubler Fx,
+Fast Tape, New Tape Format, Aspect ratio, Scandoubler Fx,
 Scale, CPU Speed, Memory, Machine, Inverse Video and Serial Port) are in OSD → **Options**.
 
 OSD options are kept only once you save them: set them, press **Right** on
@@ -89,8 +90,11 @@ This follows the hardware as emulated by
 [Jupiter-IIb](https://github.com/antonioleal/Jupiter-IIb), from the Jupiter
 II's schematics, PLD equations and ROM source.
 
-**Inverse Video** (Jupiter II) is the Jupiter II's inverse video jumper: black
-on white, or with the Expansion INK and PAPER swapped.
+**Inverse Video** (all machines, like the Jupiter II's inverse video jumper)
+swaps INK and PAPER and inverts the border: black on white with a white
+border, or with the Expansion each cell's INK and PAPER swapped and the border
+in the opposite colour (IRGB 15 minus the colour: white becomes black, bright blue
+becomes dark yellow).
 
 **The Expansion board:**
 
@@ -176,17 +180,33 @@ The new page takes over at the refresh after the next opcode fetch (that opcode
 still comes from the old page) or at an interrupt, so code that switches pages
 should run below `4000`. A reset goes back to page 0.
 
+
+**Jupiter II + Exp:** the **Memory** option does not apply; the Expansion board
+has its own 128K of RAM, laid out as follows:
+
+| Address | What is there |
+|---|---|
+| `0000-1FFF` | The Ace ROM (8K); at start-up it hands over to the Expansion ROM |
+| `2000-27FF` | Screen RAM, 1K seen twice (`2400` as the ROM uses it); two pages, chosen with `n SCREEN`. Each character cell also has a colour byte, in RAM the CPU cannot address |
+| `2800-2FFF` | Character set RAM, 1K seen twice (write only); two pages, chosen with `n FONT` |
+| `3000-37FF` | Program RAM, 2K (the system variables are at `3C00`, the same RAM as `3400`) |
+| `3800-3FFF` | The same 2K seen again |
+| `4000-7FFF` | 16K of RAM, never paged |
+| `8000-FFFF` | One of four memory pages, chosen with `n MPAGE`: pages 0, 1 and 2 are 32K of RAM each; page 3 is 16K of RAM at `8000-BFFF`, the Expansion ROM at `C000-CFFF`, and `D000-FFFF` reads `FF` |
+
+A reset selects memory page 3, screen page 1 and character set page 1. Forth's RAMTOP is `8000`, so the dictionary stays below the paged memory; the pages are for data, and for programs that switch them.
+
 **Snapshots and memory:** a snapshot records the memory size at `2080` and
 holds memory up to RAMTOP, as other emulators expect. With the 96K pack the
 page in use is saved as usual and the other page follows the end marker
 (`ACE-96K`, as Jupiter-IIb and xAce-baremetal write it; `XACE96K`, from older
-versions of xAce-baremetal, is read too); other emulators stop at the end marker
-and load it as a 51K snapshot. Loading a snapshot that needs more memory than is set (by
-its RAMTOP, its size, or a 96K page) enlarges the memory for it: the OSD shows
-"Memory raised for snapshot", and **Memory** in the OSD keeps your setting
-until you change it.
+versions of xAce-baremetal, is read too); other emulators stop at the end marker and load it as a 51K snapshot. Loading a snapshot that needs more memory than is set (by its RAMTOP, its size, or a 96K page) enlarges the memory for it: the OSD shows "Memory raised for snapshot", and **Memory** in the OSD keeps your setting until you change it.
 
 ### Tapes
+Tapes are files on the SD card only: loading from and saving to a real
+(physical) cassette recorder through the MiSTer's audio in and out is not
+supported.
+
 1. OSD → **Insert Tape** and pick a `.tap` or `.tzx` file. The tape is rewound.
 2. Type `LOAD name` (dictionary) or `0 0 BLOAD name` (bytes) on the Ace.
 3. Start the tape with **Tape Play/Pause**, or turn on **Tape Auto Play**
@@ -203,12 +223,10 @@ like a tape loop, until the program is found or you press BREAK. After a
 To eject the tape, use OSD → **Eject Tape** (or press **Backspace** in the
 **Insert Tape** file browser).
 
-**Tape Fast Load** (off by default): while the tape plays, the CPU and the
-tape both run 8 times faster, so a program loads in an eighth of the time.
-It works for every kind of tape, including TZX turbo loaders, because the
-whole machine speeds up together.
-
-**Tape Fast Save** (off by default) does the same while the Ace saves to tape.
+**Fast Tape** (off by default): while the tape plays, the CPU and the tape
+both run 8 times faster, so a program loads in an eighth of the time. It works
+for every kind of tape, including TZX turbo loaders, because the whole machine
+speeds up together. It does the same while the Ace saves to tape.
 
 The disk LED is lit while the tape plays. **Tape Sound** lets you hear it.
 

@@ -708,8 +708,19 @@ wire         hdmi_vs, hdmi_hs, hdmi_de, hdmi_vbl, hdmi_brd;
 wire         freeze;
 wire         bob_deint;
 
+// JupiterACE: the colour of the HDMI area around the picture (Inverse Video
+// makes it white), brought into the HDMI clock domain; it changes rarely
+wire  [23:0] hdmi_border;
+reg   [23:0] hdmi_border_m, hdmi_border_s;
+
 `ifndef MISTER_DEBUG_NOHDMI
 	wire clk_hdmi  = hdmi_clk_out;
+
+	always @(posedge clk_hdmi) begin
+		hdmi_border_m <= hdmi_border;
+		hdmi_border_s <= hdmi_border_m;
+	end
+
 
 	ascal 
 	#(
@@ -745,6 +756,7 @@ wire         bob_deint;
 		.run        (1),
 		.freeze     (freeze),
 		.bob_deint  (bob_deint),
+		.o_border   (hdmi_border_s),
 
 		.i_clk    (clk_ihdmi),
 		.i_ce     (ce_hpix),
@@ -1780,6 +1792,7 @@ emu emu
 	.HDMI_FREEZE(freeze),
 	.HDMI_BLACKOUT(hdmi_blackout),
 	.HDMI_BOB_DEINT(bob_deint),
+	.HDMI_BORDER(hdmi_border),
 
 	.CLK_VIDEO(clk_vid),
 	.CE_PIXEL(ce_pix),

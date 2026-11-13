@@ -11,7 +11,9 @@
 //  character cell has an attribute byte, PAPER (bits 7-4) and INK (bits 3-0),
 //  and the border has its own colour; colours are IRGB, each channel off, half
 //  or full (the colour board adds the colour and intensity lines). Without it
-//  the picture is white on black. The inverse video jumper swaps the two.
+//  the picture is white on black. Inverse Video (all machines) swaps INK and
+//  PAPER and inverts the border: white on black becomes black on white, and a
+//  colour border becomes its opposite IRGB colour (15 - colour).
 //
 //  This program is free software; you can redistribute it and/or modify it
 //  under the terms of the GNU General Public License as published by the Free
@@ -35,7 +37,7 @@ module video
 
 	input         j2,          // Jupiter II timing and border
 	input         colour,      // the Expansion's colour
-	input         inverse,     // the Jupiter II's inverse video jumper
+	input         inverse,     // Inverse Video: INK / PAPER swapped, border inverted
 
 	output  [9:0] sram_addr,
 	input   [7:0] sram_data,
@@ -104,8 +106,8 @@ always @(posedge clk) begin
 end
 
 // the pixel: INK where it is set (after inverse characters and the jumper), PAPER elsewhere
-wire       on  = pix[7] ^ inv ^ (j2 & inverse);
-wire [3:0] c   = !pic   ? (colour ? border : 4'd0) :
+wire       on  = pix[7] ^ inv ^ inverse;
+wire [3:0] c   = !pic   ? (colour ? border : 4'd0) ^ {4{inverse}} :
                  colour ? (on ? attr[3:0] : attr[7:4]) :
                  on     ? 4'd15 : 4'd0;
 

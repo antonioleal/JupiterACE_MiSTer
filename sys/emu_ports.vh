@@ -36,6 +36,7 @@ input  [11:0] HDMI_HEIGHT,
 output        HDMI_FREEZE,
 output        HDMI_BLACKOUT,
 output        HDMI_BOB_DEINT,
+output [23:0] HDMI_BORDER,    // colour of the HDMI area around the picture (JupiterACE)
 
 `ifdef MISTER_FB
 // Use framebuffer in DDRAM

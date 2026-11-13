@@ -45,6 +45,7 @@ assign VGA_DISABLE = 0;
 assign HDMI_FREEZE = 0;
 assign HDMI_BLACKOUT = 0;
 assign HDMI_BOB_DEINT = 0;
+assign HDMI_BORDER = status[27] ? 24'hFFFFFF : 24'h000000;  // Inverse Video: the area around the picture too
 
 wire [1:0] ar = status[9:8];
 video_freak video_freak
@@ -81,8 +82,7 @@ parameter CONF_STR = {
 	"P1O6,Tape Auto Play,Off,On;",
 	"P1OJ,Tape Auto Rewind,Off,On;",
 	"P1O7,Tape Sound,On,Off;",
-	"P1OF,Tape Fast Load,Off,On;",
-	"P1OH,Tape Fast Save,Off,On;",
+	"P1OF,Fast Tape,Off,On;",
 	"P1OI,New Tape Format,TAP,TZX;",
 	"P1-;",
 	"P1O89,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
@@ -112,7 +112,7 @@ pll pll
 );
 
 wire [1:0] turbo = status[5:4];
-wire       fast_load;  // Tape Fast Load/Save: CPU and tape run 8x while the tape plays or records
+wire       fast_load;  // Fast Tape: CPU and tape run 8x while the tape plays or records
 
 reg ce_pix;
 reg ce_cpu;
@@ -787,7 +787,7 @@ always @(posedge clk_sys) begin
 
 	if(wrap_on && tape_ready && ~old_end && tape_at_end) wrap_rw <= 1;
 end
-assign fast_load = (status[15] & tape_playing) | (status[17] & |save_timer) | sp_active;
+assign fast_load = (status[15] & tape_playing) | (status[15] & |save_timer) | sp_active;
 
 // Recorder: listen to MIC while the ROM SAVE routine is executing
 reg [16:0] save_timer = 0;

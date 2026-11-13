@@ -47,7 +47,7 @@ module ace
 	input        reset,
 
 	input  [1:0] mach,       // 0 Jupiter Ace, 1 Jupiter II, 2 Jupiter II + Expansion
-	input        inverse,    // the Jupiter II's inverse video jumper
+	input        inverse,    // Inverse Video (all machines, see video.v)
 
 	output [7:0] kbd_row,
 	input  [4:0] kbd_col,
@@ -299,8 +299,17 @@ wire [7:0] odd_dout = (j2x && uart_port) ? uart_dout :
 
 wire [7:0] io_dout = {8{iorq_n|rd_n}} | (~cpu_addr[0] ? {2'b11, tape_in, kbd_col} : odd_dout);
 
-// Instruction fetch inside the ROM tape loader (0x18A7-0x192C), used for tape autoplay
-assign tape_load = ~m1_n & ~mreq_n & (cpu_addr >= 16'h18A7) & (cpu_addr <= 16'h192C);
+// Instruction fetch inside the ROM tape loader (0x18A7-0x192C), used for tape
+// autoplay. Only counted once the loader has been entered at its start (18A7,
+// called by LOAD, BLOAD and VERIFY) and until an opcode is fetched outside it:
+// a fetch in the middle of that code from anywhere else does not start the tape.
+wire       ld_fetch = ~m1_n & ~mreq_n & (cpu_addr >= 16'h18A7) & (cpu_addr <= 16'h192C);
+reg        ld_in = 0;
+always @(posedge clk) begin
+	if(reset) ld_in <= 0;
+	else if(~m1_n & ~mreq_n) ld_in <= (cpu_addr == 16'h18A7) | (ld_in & ld_fetch);
+end
+assign tape_load = ld_fetch & (ld_in | (cpu_addr == 16'h18A7));
 
 // The ROM parses the tape name into 2702 (the same RAM as 2302, where the tape
 // header is built): remember its first character, 00 or space when blank
